@@ -11,6 +11,20 @@ Wavefront compute pipeline rendering a normal-shaded analytic sphere via ray tra
 2. **Sphere intersection** — analytic quadratic solve against a single hardcoded sphere; hit pixels shaded by surface normal mapped to RGB
 3. **HDR pipeline** — compute writes to `rgba16float` storage texture; fullscreen blit pass reads it to canvas (clamp tonemapping, Khronos PBR Neutral in a later step)
 
+## Implementation Progress
+
+- [x] Step 3 — Ray generation kernel
+- [x] Step 4 — Analytic sphere intersection, normal shading, HDR pipeline
+- [ ] Step 5 — BVH scaffold
+- [ ] Step 6 — Material system
+- [ ] Step 7 — Next event estimation
+- [ ] Step 8 — Sky mask
+- [ ] Step 9 — Temporal accumulation
+- [ ] Step 10 — Denoiser
+- [ ] Step 11 — Tone mapping and bloom
+- [ ] Step 12 — Ball animation
+- [ ] Step 13 — Kinematic switching
+
 ## Stack
 
 | | |

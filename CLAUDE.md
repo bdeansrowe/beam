@@ -387,3 +387,10 @@ See `ltbl_modeling_requirements.md` for full detail.
 13. Kinematic switching (Phase 3) — only after Phase 2 works
 
 **Do not proceed to the next step until the current step produces correct, validated output.**
+
+---
+
+## Documentation
+
+Update README.md to reflect current state when completing each
+numbered implementation step.
