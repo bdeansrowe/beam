@@ -5,25 +5,20 @@ use wgpu::*;
 use winit::{dpi::PhysicalSize, window::Window};
 
 // ── Camera uniform — mirrors WGSL `struct Camera` in ray_gen.wgsl ─────────────
-// Layout: five vec4s = 80 bytes. Must stay in sync with the WGSL struct.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct CameraUniform {
-    origin:     [f32; 4],  // .xyz = camera position
-    lower_left: [f32; 4],  // .xyz = image-plane lower-left corner
-    horizontal: [f32; 4],  // .xyz = image-plane horizontal span
-    vertical:   [f32; 4],  // .xyz = image-plane vertical span
+    origin:     [f32; 4],
+    lower_left: [f32; 4],
+    horizontal: [f32; 4],
+    vertical:   [f32; 4],
     dims:       [u32; 4],  // [0]=width [1]=height [2]=frame [3]=pad
 }
 
 impl CameraUniform {
     fn new(width: u32, height: u32, frame: u32) -> Self {
-        // Pinhole: origin at (0,0,3), looking toward origin, 60° vertical FOV,
-        // forward = -Z, right = +X, up = +Y.
         let half_h = (60.0_f32.to_radians() * 0.5).tan();
         let half_w = (width as f32 / height as f32) * half_h;
-
-        // lower_left = origin + forward(0,0,-1) - half_w*right - half_h*up
         CameraUniform {
             origin:     [0.0, 0.0, 3.0, 0.0],
             lower_left: [-half_w, -half_h, 2.0, 0.0],
@@ -36,22 +31,32 @@ impl CameraUniform {
 
 // ── GPU state ──────────────────────────────────────────────────────────────────
 pub struct GpuState {
-    surface:          Surface<'static>,
-    device:           Device,
-    queue:            Queue,
-    config:           SurfaceConfiguration,
-    pub size:         PhysicalSize<u32>,
-
-    // Raster pipeline (RGB triangle — scaffold, replaced in Step 4)
-    render_pipeline:  RenderPipeline,
+    surface:  Surface<'static>,
+    device:   Device,
+    queue:    Queue,
+    config:   SurfaceConfiguration,
+    pub size: PhysicalSize<u32>,
 
     // Ray generation (Step 3)
     camera_buf:       Buffer,
+    #[allow(dead_code)]
     ray_buf:          Buffer,
     ray_gen_pipeline: ComputePipeline,
     ray_gen_bg0:      BindGroup,
     ray_gen_bg1:      BindGroup,
-    frame:            u32,
+
+    // Sphere intersection + HDR output (Step 4)
+    #[allow(dead_code)]
+    hdr_texture:        Texture,
+    intersect_pipeline: ComputePipeline,
+    intersect_bg1:      BindGroup,
+    empty_bg0:          BindGroup,
+
+    // Blit to canvas (Step 4)
+    blit_pipeline: RenderPipeline,
+    blit_bg0:      BindGroup,
+
+    frame: u32,
 }
 
 impl GpuState {
@@ -60,29 +65,21 @@ impl GpuState {
             #[cfg(target_arch = "wasm32")]
             {
                 use winit::dpi::PhysicalSize;
-                let canvas = web_sys::window()
-                    .unwrap()
-                    .document()
-                    .unwrap()
-                    .get_element_by_id("canvas")
-                    .unwrap();
+                let canvas = web_sys::window().unwrap().document().unwrap()
+                    .get_element_by_id("canvas").unwrap();
                 let canvas: web_sys::HtmlCanvasElement =
                     wasm_bindgen::JsCast::dyn_into(canvas).unwrap();
                 PhysicalSize::new(canvas.width(), canvas.height())
             }
             #[cfg(not(target_arch = "wasm32"))]
-            {
-                window.inner_size()
-            }
+            { window.inner_size() }
         };
 
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::BROWSER_WEBGPU,
             ..Default::default()
         });
-
         let surface = instance.create_surface(window)?;
-
         let adapter = instance
             .request_adapter(&RequestAdapterOptions {
                 power_preference:       PowerPreference::HighPerformance,
@@ -104,11 +101,8 @@ impl GpuState {
             .await?;
 
         let surface_caps   = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
+        let surface_format = surface_caps.formats.iter()
+            .find(|f| f.is_srgb()).copied()
             .unwrap_or(surface_caps.formats[0]);
 
         let config = SurfaceConfiguration {
@@ -123,54 +117,195 @@ impl GpuState {
         };
         surface.configure(&device, &config);
 
-        let render_pipeline = Self::create_render_pipeline(&device, &config);
-
         let (ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf) =
             Self::create_ray_gen(&device, size.width, size.height);
 
+        let (hdr_texture, hdr_view, intersect_pipeline, intersect_bg1, empty_bg0) =
+            Self::create_intersect(&device, &ray_buf, size.width, size.height);
+
+        let (blit_pipeline, blit_bg0) =
+            Self::create_blit(&device, &config, &hdr_view);
+
         log::info!(
-            "Ray gen ready: {}×{} = {} rays ({} KB)",
+            "Step 4 ready: {}×{} rays, HDR texture allocated",
             size.width, size.height,
-            size.width * size.height,
-            size.width * size.height * 32 / 1024,
         );
 
         Ok(Self {
-            surface,
-            device,
-            queue,
-            config,
-            size,
-            render_pipeline,
-            camera_buf,
-            ray_buf,
-            ray_gen_pipeline,
-            ray_gen_bg0,
-            ray_gen_bg1,
+            surface, device, queue, config, size,
+            camera_buf, ray_buf, ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1,
+            hdr_texture, intersect_pipeline, intersect_bg1, empty_bg0,
+            blit_pipeline, blit_bg0,
             frame: 0,
         })
     }
 
-    fn create_render_pipeline(device: &Device, config: &SurfaceConfiguration) -> RenderPipeline {
-        let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
+    fn create_ray_gen(
+        device: &Device, width: u32, height: u32,
+    ) -> (ComputePipeline, BindGroup, BindGroup, Buffer, Buffer) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Ray Gen BG0"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Ray Gen BG1"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let camera_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Camera Uniform"),
+            size:  std::mem::size_of::<CameraUniform>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ray_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Ray Buffer"),
+            size:  (width * height * 32) as u64,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let ray_gen_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Ray Gen BG0"), layout: &bg0_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() }],
+        });
+        let ray_gen_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Ray Gen BG1"), layout: &bg1_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() }],
+        });
+
+        let shader = device.create_shader_module(include_wgsl!("ray_gen.wgsl"));
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label:                Some("Raster Layout"),
-            bind_group_layouts:   &[],
+            label: Some("Ray Gen Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
             push_constant_ranges: &[],
         });
-        device.create_render_pipeline(&RenderPipelineDescriptor {
-            label:  Some("Raster Pipeline"),
-            layout: Some(&layout),
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Ray Gen"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+
+        (pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf)
+    }
+
+    fn create_intersect(
+        device: &Device, ray_buf: &Buffer, width: u32, height: u32,
+    ) -> (Texture, TextureView, ComputePipeline, BindGroup, BindGroup) {
+        let hdr_texture = device.create_texture(&TextureDescriptor {
+            label:            Some("HDR Texture"),
+            size:             Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count:  1,
+            sample_count:     1,
+            dimension:        TextureDimension::D2,
+            format:           TextureFormat::Rgba16Float,
+            usage:            TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+            view_formats:     &[],
+        });
+        let hdr_view = hdr_texture.create_view(&TextureViewDescriptor::default());
+
+        // Empty group 0 — placeholder for BVH/geometry in Step 5
+        let empty_bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Empty BG0"), entries: &[],
+        });
+        let empty_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Empty BG0"), layout: &empty_bg0_layout, entries: &[],
+        });
+
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Intersect BG1"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::StorageTexture {
+                        access:         StorageTextureAccess::WriteOnly,
+                        format:         TextureFormat::Rgba16Float,
+                        view_dimension: TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let intersect_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Intersect BG1"), layout: &bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&hdr_view) },
+            ],
+        });
+
+        let shader = device.create_shader_module(include_wgsl!("intersect.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Intersect Layout"),
+            bind_group_layouts: &[&empty_bg0_layout, &bg1_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Intersect"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+
+        (hdr_texture, hdr_view, pipeline, intersect_bg1, empty_bg0)
+    }
+
+    fn create_blit(
+        device: &Device, config: &SurfaceConfiguration, hdr_view: &TextureView,
+    ) -> (RenderPipeline, BindGroup) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Blit BG0"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type:    TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled:   false,
+                },
+                count: None,
+            }],
+        });
+        let blit_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Blit BG0"), layout: &bg0_layout,
+            entries: &[BindGroupEntry {
+                binding: 0, resource: BindingResource::TextureView(hdr_view),
+            }],
+        });
+
+        let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Blit Layout"),
+            bind_group_layouts: &[&bg0_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Blit Pipeline"), layout: Some(&layout),
             vertex: VertexState {
-                module:              &shader,
-                entry_point:         Some("vs_main"),
-                buffers:             &[],
-                compilation_options: Default::default(),
+                module: &shader, entry_point: Some("vs_main"),
+                buffers: &[], compilation_options: Default::default(),
             },
             fragment: Some(FragmentState {
-                module:              &shader,
-                entry_point:         Some("fs_main"),
-                targets:             &[Some(ColorTargetState {
+                module: &shader, entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
                     format:     config.format,
                     blend:      Some(BlendState::REPLACE),
                     write_mask: ColorWrites::ALL,
@@ -182,90 +317,9 @@ impl GpuState {
             multisample:   MultisampleState::default(),
             multiview:     None,
             cache:         None,
-        })
-    }
-
-    fn create_ray_gen(
-        device: &Device,
-        width: u32,
-        height: u32,
-    ) -> (ComputePipeline, BindGroup, BindGroup, Buffer, Buffer) {
-        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label:   Some("Ray Gen BG0"),
-            entries: &[BindGroupLayoutEntry {
-                binding:    0,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty:                 BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size:   None,
-                },
-                count: None,
-            }],
         });
 
-        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label:   Some("Ray Gen BG1"),
-            entries: &[BindGroupLayoutEntry {
-                binding:    0,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty:                 BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size:   None,
-                },
-                count: None,
-            }],
-        });
-
-        let camera_buf = device.create_buffer(&BufferDescriptor {
-            label:              Some("Camera Uniform"),
-            size:               std::mem::size_of::<CameraUniform>() as u64,
-            usage:              BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let ray_buf = device.create_buffer(&BufferDescriptor {
-            label:              Some("Ray Buffer"),
-            size:               (width * height * 32) as u64,  // 32 bytes per Ray
-            usage:              BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let ray_gen_bg0 = device.create_bind_group(&BindGroupDescriptor {
-            label:   Some("Ray Gen BG0"),
-            layout:  &bg0_layout,
-            entries: &[BindGroupEntry {
-                binding:  0,
-                resource: camera_buf.as_entire_binding(),
-            }],
-        });
-
-        let ray_gen_bg1 = device.create_bind_group(&BindGroupDescriptor {
-            label:   Some("Ray Gen BG1"),
-            layout:  &bg1_layout,
-            entries: &[BindGroupEntry {
-                binding:  0,
-                resource: ray_buf.as_entire_binding(),
-            }],
-        });
-
-        let shader = device.create_shader_module(include_wgsl!("ray_gen.wgsl"));
-        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label:                Some("Ray Gen Layout"),
-            bind_group_layouts:   &[&bg0_layout, &bg1_layout],
-            push_constant_ranges: &[],
-        });
-        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label:               Some("Ray Gen Pipeline"),
-            layout:              Some(&pipeline_layout),
-            module:              &shader,
-            entry_point:         Some("main"),
-            compilation_options: Default::default(),
-            cache:               None,
-        });
-
-        (pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf)
+        (pipeline, blit_bg0)
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -291,32 +345,44 @@ impl GpuState {
             label: Some("Frame Encoder"),
         });
 
-        // Ray generation compute pass
+        // 1. Ray generation
         {
             let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
-                label:            Some("Ray Gen"),
-                timestamp_writes: None,
+                label: Some("Ray Gen"), timestamp_writes: None,
             });
             cpass.set_pipeline(&self.ray_gen_pipeline);
             cpass.set_bind_group(0, &self.ray_gen_bg0, &[]);
             cpass.set_bind_group(1, &self.ray_gen_bg1, &[]);
             cpass.dispatch_workgroups(
-                (self.size.width  + 7) / 8,
+                (self.size.width + 7) / 8,
                 (self.size.height + 7) / 8,
                 1,
             );
         }
 
-        // Raster pass — RGB triangle scaffold, replaced in Step 4
+        // 2. Sphere intersection → HDR texture
         {
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label:                    Some("Raster Pass"),
+            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("Intersect"), timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.intersect_pipeline);
+            cpass.set_bind_group(0, &self.empty_bg0, &[]);
+            cpass.set_bind_group(1, &self.intersect_bg1, &[]);
+            cpass.dispatch_workgroups(
+                (self.size.width + 7) / 8,
+                (self.size.height + 7) / 8,
+                1,
+            );
+        }
+
+        // 3. Blit HDR texture → canvas
+        {
+            let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label:                    Some("Blit"),
                 color_attachments:        &[Some(RenderPassColorAttachment {
-                    view:           &view,
-                    resolve_target: None,
-                    depth_slice:    None,
+                    view: &view, resolve_target: None, depth_slice: None,
                     ops: Operations {
-                        load:  LoadOp::Clear(Color { r: 0.05, g: 0.05, b: 0.1, a: 1.0 }),
+                        load:  LoadOp::Clear(Color::BLACK),
                         store: StoreOp::Store,
                     },
                 })],
@@ -324,8 +390,9 @@ impl GpuState {
                 timestamp_writes:         None,
                 occlusion_query_set:      None,
             });
-            pass.set_pipeline(&self.render_pipeline);
-            pass.draw(0..3, 0..1);
+            rpass.set_pipeline(&self.blit_pipeline);
+            rpass.set_bind_group(0, &self.blit_bg0, &[]);
+            rpass.draw(0..3, 0..1);
         }
 
         self.frame += 1;
