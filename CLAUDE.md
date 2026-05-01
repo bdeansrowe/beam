@@ -232,12 +232,15 @@ A large fraction of pixels (potentially 40-60%) are background pixels whose prim
 miss the egg and hit the static HDR environment. These never need re-dispatching.
 
 **TWO SHADERS, NOT ONE WITH A CONDITIONAL:**
-- **Frame 0 shader:** fires all pixels, writes per-pixel sky mask (1 bit/pixel) flagging
-  misses. Runs ONCE at scene initialization.
-- **Per-frame shader:** reads sky mask, dispatches only egg-hitting pixels via stream
-  compaction. No conditional branch in hot path.
+- **Frame 0 shader:** fires all pixels, writes per-pixel sky mask (1 bit/pixel) flagging misses. Then runs a dilation pass: any miss-pixel within SKY_MASK_DILATION_RADIUS pixels (8-connected, Chebyshev distance) of a hit-pixel is promoted to hit and will be re-dispatched every frame. This preserves correct temporal accumulation and jitter-based antialiasing along the egg's silhouette edge — without dilation, edge pixels classified as misses on frame 0 would never accumulate the hit samples needed for smooth antialiasing. SKY_MASK_DILATION_RADIUS defaults to 1; increase to 2 or 3 to trade a slightly larger dispatch footprint for more conservative silhouette protection. Runs ONCE at scene initialization.
+- **Per-frame shader:** reads the dilated sky mask, dispatches only egg-hitting pixels (including the dilated border) via stream compaction. Confirmed interior-miss pixels are permanently skipped. No conditional branch in hot path.
 
 Invalidate and recompute sky mask if camera moves or egg moves.
+
+**REJECTED ALTERNATIVES:**
+
+**No dilation (null option):** rejected. "Good enough" on the silhouette of the primary visual object in a beauty-first game is not good enough. One pixel of hard aliasing on the egg's edge is visible and unacceptable.
+**Probabilistic mask:** fire N probe rays per edge pixel, record hit probability, threshold for skip/dispatch. More accurate but significantly more complex. Revisit only if SKY_MASK_DILATION_RADIUS=1 proves insufficient for silhouette quality at game viewing distances.
 
 ### 2. Variable Sample Counts / Foveated Sampling
 - Ball region gets elevated samples — importance sampling toward ball's apparent position
