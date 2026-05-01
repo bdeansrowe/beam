@@ -174,6 +174,73 @@ without hitting geometry, sample the HDR environment map directly using ray dire
 
 ---
 
+## BVH Node Structure
+
+### BvhNode Layout (Rust + WGSL)
+
+```rust
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct BvhNode {
+    aabb_min_left_start:  [f32; 4],  // .xyz=aabb_min, .w=left_child|prim_start|sphere_index
+    aabb_max_right_count: [f32; 4],  // .xyz=aabb_max, .w=right_child|prim_count|unused
+    node_type:            u32,       // NODE_INTERNAL|NODE_LEAF_TRIANGLE|NODE_LEAF_SPHERE|NODE_LEAF_QUARTIC
+    _reserved:            [u32; 3],  // reserved for future primitive types — do not repurpose
+}
+// 48 bytes total. WGSL struct must mirror exactly.
+```
+
+### Node Type Constants
+
+```rust
+const NODE_INTERNAL:      u32 = 0;  // left/right are child indices into node buffer
+const NODE_LEAF_TRIANGLE: u32 = 1;  // .w fields are prim_start + prim_count into geometry buffer
+const NODE_LEAF_SPHERE:   u32 = 2;  // .w of first field is sphere_index into sphere buffer
+const NODE_LEAF_QUARTIC:  u32 = 3;  // reserved: future analytic egg surface
+```
+
+### Accessor Methods (Rust)
+
+Implement `.to_bits()` accessors on `BvhNode` for all `.w` field interpretations.
+Named accessors are load-bearing documentation — use `left_child()`, `prim_start()`,
+and `sphere_index()` as distinct methods even though they read the same bits.
+Never access `.w` fields directly in traversal or shading code.
+
+### Traversal Stack
+
+WGSL has no recursion. Traversal uses an explicit local stack:
+
+```wgsl
+var stack: array<u32, 32>;  // node indices, 32 deep
+var stack_ptr: i32 = 0;
+```
+
+32 entries is conservative headroom for ltbl's scene. Do not increase without profiling.
+
+### TLAS Instance Layout
+
+```rust
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct TlasInstance {
+    transform:   [f32; 16],  // mat4x4 world transform, 64 bytes
+    blas_offset: u32,        // index of BLAS root node in node buffer
+    flags:       u32,        // reserved for static/dynamic kinematic switching
+    _reserved:   [u32; 2],   // alignment
+}
+// 80 bytes total.
+```
+
+### Two-Level Buffer Layout
+
+- Single node buffer contains both TLAS and BLAS nodes
+- TLAS nodes occupy indices 0..tlas_node_count
+- Each BLAS occupies a contiguous range starting at its `blas_offset`
+- Sphere primitives live in a separate sphere buffer (center + radius, fixed size)
+- Triangle primitives live in the geometry buffer (defined in Step 5.5)
+
+---
+
 ## Wavefront Architecture — Key Principles
 
 ### Separate Dispatches Per Ray Type
