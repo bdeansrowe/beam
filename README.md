@@ -16,6 +16,7 @@ Wavefront compute pipeline rendering a normal-shaded analytic sphere via ray tra
 - [x] Step 3 — Ray generation kernel
 - [x] Step 4 — Analytic sphere intersection, normal shading, HDR pipeline
 - [ ] Step 5 — BVH scaffold
+- [ ] Step 5.5 — Geometry buffer format (dual-material triangles)
 - [ ] Step 6 — Material system
 - [ ] Step 7 — Next event estimation
 - [ ] Step 8 — Sky mask

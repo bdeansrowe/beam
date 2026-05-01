@@ -379,8 +379,9 @@ See `ltbl_modeling_requirements.md` for full detail.
 2. Create/refine this CLAUDE.md in the repository
 3. Ray generation kernel — pinhole camera, rays into storage buffer, no intersection yet
 4. Analytic sphere intersection — shade by normal, first visible path-traced output
-5. BVH scaffold — TLAS/BLAS structure with trivial static scene (one sphere instance)
-6. Material system — diffuse first, specular, then glass BSDF
+5  BVH scaffold (TLAS/BLAS structure, sphere only, no triangles)
+5.5 Geometry buffer format (dual-material triangle record definition)
+6  Material system — diffuse first, specular, then glass BSDF
 7. Next event estimation — shadow rays, direct lighting
 8. Sky mask — frame 0 initialization + per-frame masked dispatch
 9. Temporal accumulation — with jitter, weighted accumulation buffer from the start
@@ -388,6 +389,12 @@ See `ltbl_modeling_requirements.md` for full detail.
 11. Tone mapping and bloom
 12. Ball animation (Phase 2) — only after Phase 1 rendering is correct and validated
 13. Kinematic switching (Phase 3) — only after Phase 2 works
+
+**Step 5.5 — Geometry buffer format:** Define the dual-material triangle 
+record struct before implementing the material system. Each triangle record 
+carries front_material_id and back_material_id. The BVH leaf node references 
+a range of records in this buffer by index. No rendering changes — this step 
+is data structure definition only.
 
 **Do not proceed to the next step until the current step produces correct, validated output.**
 
