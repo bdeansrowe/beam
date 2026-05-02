@@ -1,6 +1,7 @@
 use wasm_bindgen::prelude::*;
 
 mod app;
+mod bvh;
 mod gpu;
 
 // Expose a clean entry point to JavaScript

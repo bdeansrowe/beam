@@ -231,6 +231,13 @@ struct TlasInstance {
 // 80 bytes total.
 ```
 
+**TlasInstance — inverse transform (pinned):** When non-identity instance 
+transforms arrive (egg geometry, Step 5.5+), add inv_transform: [f32; 16] 
+to TlasInstance (144 bytes total). The WGSL traversal kernel currently 
+applies transform directly — this works only for identity. The inverse is 
+required for correct ray-to-local-space transformation for non-identity 
+instances. Do not add until there is actual non-identity geometry to test against.
+
 ### Two-Level Buffer Layout
 
 - Single node buffer contains both TLAS and BLAS nodes

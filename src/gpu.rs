@@ -4,6 +4,8 @@ use std::rc::Rc;
 use wgpu::*;
 use winit::{dpi::PhysicalSize, window::Window};
 
+use crate::bvh::build_trivial_scene;
+
 // ── Camera uniform — mirrors WGSL `struct Camera` in ray_gen.wgsl ─────────────
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -45,12 +47,20 @@ pub struct GpuState {
     ray_gen_bg0:      BindGroup,
     ray_gen_bg1:      BindGroup,
 
-    // Sphere intersection + HDR output (Step 4)
+    // BVH scene buffers (Step 5)
+    #[allow(dead_code)]
+    bvh_node_buf:      Buffer,
+    #[allow(dead_code)]
+    tlas_instance_buf: Buffer,
+    #[allow(dead_code)]
+    sphere_buf:        Buffer,
+
+    // Sphere intersection + HDR output (Step 4/5)
     #[allow(dead_code)]
     hdr_texture:        Texture,
     intersect_pipeline: ComputePipeline,
     intersect_bg1:      BindGroup,
-    empty_bg0:          BindGroup,
+    scene_bg0:          BindGroup,
 
     // Blit to canvas (Step 4)
     blit_pipeline: RenderPipeline,
@@ -120,24 +130,53 @@ impl GpuState {
         let (ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf) =
             Self::create_ray_gen(&device, size.width, size.height);
 
-        let (hdr_texture, hdr_view, intersect_pipeline, intersect_bg1, empty_bg0) =
-            Self::create_intersect(&device, &ray_buf, size.width, size.height);
+        let (bvh_node_buf, tlas_instance_buf, sphere_buf) =
+            Self::create_bvh_buffers(&device);
+
+        let (hdr_texture, hdr_view, intersect_pipeline, intersect_bg1, scene_bg0) =
+            Self::create_intersect(
+                &device, &ray_buf,
+                &bvh_node_buf, &tlas_instance_buf, &sphere_buf,
+                size.width, size.height,
+            );
 
         let (blit_pipeline, blit_bg0) =
             Self::create_blit(&device, &config, &hdr_view);
 
         log::info!(
-            "Step 4 ready: {}×{} rays, HDR texture allocated",
+            "Step 5 ready: {}×{} rays, BVH scaffold online",
             size.width, size.height,
         );
 
         Ok(Self {
             surface, device, queue, config, size,
             camera_buf, ray_buf, ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1,
-            hdr_texture, intersect_pipeline, intersect_bg1, empty_bg0,
+            bvh_node_buf, tlas_instance_buf, sphere_buf,
+            hdr_texture, intersect_pipeline, intersect_bg1, scene_bg0,
             blit_pipeline, blit_bg0,
             frame: 0,
         })
+    }
+
+    fn upload_slice<T: Pod>(device: &Device, label: &str, data: &[T]) -> Buffer {
+        let bytes = bytemuck::cast_slice(data);
+        let buf = device.create_buffer(&BufferDescriptor {
+            label:              Some(label),
+            size:               bytes.len() as u64,
+            usage:              BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        buf.slice(..).get_mapped_range_mut().copy_from_slice(bytes);
+        buf.unmap();
+        buf
+    }
+
+    fn create_bvh_buffers(device: &Device) -> (Buffer, Buffer, Buffer) {
+        let (nodes, instances, spheres) = build_trivial_scene();
+        let bvh_node_buf      = Self::upload_slice(device, "BVH Nodes",      &nodes);
+        let tlas_instance_buf = Self::upload_slice(device, "TLAS Instances", &instances);
+        let sphere_buf        = Self::upload_slice(device, "Spheres",        &spheres);
+        (bvh_node_buf, tlas_instance_buf, sphere_buf)
     }
 
     fn create_ray_gen(
@@ -203,7 +242,13 @@ impl GpuState {
     }
 
     fn create_intersect(
-        device: &Device, ray_buf: &Buffer, width: u32, height: u32,
+        device:           &Device,
+        ray_buf:          &Buffer,
+        bvh_node_buf:     &Buffer,
+        tlas_instance_buf: &Buffer,
+        sphere_buf:       &Buffer,
+        width:  u32,
+        height: u32,
     ) -> (Texture, TextureView, ComputePipeline, BindGroup, BindGroup) {
         let hdr_texture = device.create_texture(&TextureDescriptor {
             label:            Some("HDR Texture"),
@@ -217,14 +262,46 @@ impl GpuState {
         });
         let hdr_view = hdr_texture.create_view(&TextureViewDescriptor::default());
 
-        // Empty group 0 — placeholder for BVH/geometry in Step 5
-        let empty_bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("Empty BG0"), entries: &[],
+        // BG0 — scene-global: BVH nodes, TLAS instances, spheres
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Intersect BG0"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
-        let empty_bg0 = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("Empty BG0"), layout: &empty_bg0_layout, entries: &[],
+        let scene_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Intersect BG0"), layout: &bg0_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: bvh_node_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: tlas_instance_buf.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: sphere_buf.as_entire_binding() },
+            ],
         });
 
+        // BG1 — per-pass: ray buffer, HDR output
         let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Intersect BG1"),
             entries: &[
@@ -258,7 +335,7 @@ impl GpuState {
         let shader = device.create_shader_module(include_wgsl!("intersect.wgsl"));
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("Intersect Layout"),
-            bind_group_layouts: &[&empty_bg0_layout, &bg1_layout],
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
@@ -266,7 +343,7 @@ impl GpuState {
             entry_point: Some("main"), compilation_options: Default::default(), cache: None,
         });
 
-        (hdr_texture, hdr_view, pipeline, intersect_bg1, empty_bg0)
+        (hdr_texture, hdr_view, pipeline, intersect_bg1, scene_bg0)
     }
 
     fn create_blit(
@@ -360,13 +437,13 @@ impl GpuState {
             );
         }
 
-        // 2. Sphere intersection → HDR texture
+        // 2. BVH traversal → HDR texture
         {
             let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("Intersect"), timestamp_writes: None,
             });
             cpass.set_pipeline(&self.intersect_pipeline);
-            cpass.set_bind_group(0, &self.empty_bg0, &[]);
+            cpass.set_bind_group(0, &self.scene_bg0, &[]);
             cpass.set_bind_group(1, &self.intersect_bg1, &[]);
             cpass.dispatch_workgroups(
                 (self.size.width + 7) / 8,
