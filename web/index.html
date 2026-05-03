@@ -3,16 +3,48 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>wgpu + WASM</title>
+  <title>ltbl: FORCE</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #0d0d0d; display: flex; justify-content: center; align-items: center; height: 100vh; }
     canvas { display: block; width: 800px; height: 600px; }
+    #perf {
+      position: fixed; top: 8px; left: 8px; z-index: 10;
+      background: rgba(0,0,0,0.65); color: #7fffb0;
+      font: 12px/1.7 'Courier New', monospace;
+      padding: 5px 10px; border-radius: 4px;
+      pointer-events: none; user-select: none; white-space: pre;
+    }
   </style>
 </head>
 <body>
   <!-- wgpu/winit will attach to this canvas -->
   <canvas id="canvas" width="800" height="600"></canvas>
+  <div id="perf"></div>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const perf   = document.getElementById('perf');
+    let smoothMs = 16.67;
+    let last     = performance.now();
+    let tick     = 0;
+
+    function loop(now) {
+      const delta = now - last;
+      last = now;
+      smoothMs = smoothMs * 0.9 + delta * 0.1;
+      if (++tick % 10 === 0) {
+        const fps   = 1000 / smoothMs;
+        const mrays = (canvas.width * canvas.height * fps) / 1e6;
+        perf.textContent =
+          ` FPS  ${fps.toFixed(1)}\n` +
+          `  ms  ${smoothMs.toFixed(1)}\n` +
+          `Mrays ${mrays.toFixed(2)}`;
+      }
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  </script>
 
   <script type="module">
     // wasm-pack outputs to ./pkg by default (see build script)
