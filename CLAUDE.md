@@ -246,6 +246,37 @@ instances. Do not add until there is actual non-identity geometry to test agains
 - Sphere primitives live in a separate sphere buffer (center + radius, fixed size)
 - Triangle primitives live in the geometry buffer (defined in Step 5.5)
 
+### Geometry Buffer Format (Step 5.5)
+
+Two new structs in `bvh.rs`. Both 32 bytes. Both `#[repr(C)]`,
+`Pod`, `Zeroable`.
+
+```rust
+pub struct Vertex {
+    pub position: [f32; 4],  // .xyz = position, .w = 0.0 (pad)
+    pub normal:   [f32; 4],  // .xyz = normal,   .w = 0.0 (pad)
+}
+// 32 bytes. [f32;4] not [f32;3] — WGSL vec3<f32> has 16-byte
+// alignment; [f32;4] keeps the struct a clean multiple of 16.
+
+pub struct TriangleRecord {
+    pub v0:                u32,  // index into vertex buffer
+    pub v1:                u32,
+    pub v2:                u32,
+    pub front_material_id: u32,
+    pub back_material_id:  u32,
+    pub _pad:              [u32; 3],
+}
+// 32 bytes. Both material IDs present on every triangle —
+// required for correct medium stack push/pop on ray entry/exit
+// through glass surfaces.
+```
+
+Add `vertex_buf` and `geometry_buf` to `GpuState`. Allocate both
+at startup with a minimal placeholder (one zeroed Vertex, one
+zeroed TriangleRecord). No rendering changes — this step is data
+structure and buffer allocation only.
+
 ---
 
 ## Wavefront Architecture — Key Principles

@@ -26,6 +26,22 @@ struct Sphere {
     center_radius: vec4<f32>,  // .xyz=center  .w=radius
 }  // 16 bytes
 
+struct Vertex {
+    position: vec4<f32>,  // .xyz=position  .w=0.0
+    normal:   vec4<f32>,  // .xyz=normal    .w=0.0
+}  // 32 bytes
+
+struct TriangleRecord {
+    v0:                u32,
+    v1:                u32,
+    v2:                u32,
+    front_material_id: u32,
+    back_material_id:  u32,
+    _pad0:             u32,
+    _pad1:             u32,
+    _pad2:             u32,
+}  // 32 bytes
+
 // ── Node type constants ───────────────────────────────────────────────────────
 const NODE_INTERNAL:      u32 = 0u;
 const NODE_LEAF_TRIANGLE: u32 = 1u;
@@ -39,6 +55,9 @@ const INVALID_NODE: u32 = 0xFFFFFFFFu;
 @group(0) @binding(0) var<storage, read> bvh_nodes      : array<BvhNode>;
 @group(0) @binding(1) var<storage, read> tlas_instances : array<TlasInstance>;
 @group(0) @binding(2) var<storage, read> spheres        : array<Sphere>;
+// Step 5.5 — declared, not yet used
+@group(0) @binding(3) var<storage, read> vertices       : array<Vertex>;
+@group(0) @binding(4) var<storage, read> geometry       : array<TriangleRecord>;
 
 // group(1) = per-pass resources (ray buffer, output texture)
 @group(1) @binding(0) var<storage, read> rays    : array<Ray>;

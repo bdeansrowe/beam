@@ -42,6 +42,24 @@ pub struct Sphere {
     pub center_radius: [f32; 4],  // .xyz=center, .w=radius
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct Vertex {
+    pub position: [f32; 4],  // .xyz=position, .w=0.0
+    pub normal:   [f32; 4],  // .xyz=normal,   .w=0.0
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct TriangleRecord {
+    pub v0:                u32,
+    pub v1:                u32,
+    pub v2:                u32,
+    pub front_material_id: u32,
+    pub back_material_id:  u32,
+    pub _pad:              [u32; 3],
+}
+
 pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
     let nodes = vec![
         // Node 0: BLAS leaf — unit sphere at origin, sphere_index=0

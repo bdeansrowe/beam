@@ -15,9 +15,9 @@ wasm-pack build \
 echo "→ Build complete. Output: web/pkg/"
 
 # ── Serve ─────────────────────────────────────────────────────────────────────
-echo "→ Serving on http://localhost:9000 ..."
+echo "→ Serving on http://localhost:9666 ..."
 cd web
-basic-http-server --addr 127.0.0.1:9000 .
+basic-http-server --addr 127.0.0.1:9666 .
 
 # Alternative (no install needed):
 # python3 -m http.server 8080

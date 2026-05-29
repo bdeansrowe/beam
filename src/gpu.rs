@@ -4,7 +4,7 @@ use std::rc::Rc;
 use wgpu::*;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::bvh::build_trivial_scene;
+use crate::bvh::{build_trivial_scene, Vertex, TriangleRecord};
 
 // ── Camera uniform — mirrors WGSL `struct Camera` in ray_gen.wgsl ─────────────
 #[repr(C)]
@@ -54,6 +54,12 @@ pub struct GpuState {
     tlas_instance_buf: Buffer,
     #[allow(dead_code)]
     sphere_buf:        Buffer,
+
+    // Geometry buffers (Step 5.5)
+    #[allow(dead_code)]
+    vertex_buf:   Buffer,
+    #[allow(dead_code)]
+    geometry_buf: Buffer,
 
     // Sphere intersection + HDR output (Step 4/5)
     #[allow(dead_code)]
@@ -130,13 +136,14 @@ impl GpuState {
         let (ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf) =
             Self::create_ray_gen(&device, size.width, size.height);
 
-        let (bvh_node_buf, tlas_instance_buf, sphere_buf) =
+        let (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf) =
             Self::create_bvh_buffers(&device);
 
         let (hdr_texture, hdr_view, intersect_pipeline, intersect_bg1, scene_bg0) =
             Self::create_intersect(
                 &device, &ray_buf,
                 &bvh_node_buf, &tlas_instance_buf, &sphere_buf,
+                &vertex_buf, &geometry_buf,
                 size.width, size.height,
             );
 
@@ -144,7 +151,7 @@ impl GpuState {
             Self::create_blit(&device, &config, &hdr_view);
 
         log::info!(
-            "Step 5 ready: {}×{} rays, BVH scaffold online",
+            "Step 5.5 ready: {}×{} rays, geometry buffers online",
             size.width, size.height,
         );
 
@@ -152,6 +159,7 @@ impl GpuState {
             surface, device, queue, config, size,
             camera_buf, ray_buf, ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1,
             bvh_node_buf, tlas_instance_buf, sphere_buf,
+            vertex_buf, geometry_buf,
             hdr_texture, intersect_pipeline, intersect_bg1, scene_bg0,
             blit_pipeline, blit_bg0,
             frame: 0,
@@ -171,12 +179,14 @@ impl GpuState {
         buf
     }
 
-    fn create_bvh_buffers(device: &Device) -> (Buffer, Buffer, Buffer) {
+    fn create_bvh_buffers(device: &Device) -> (Buffer, Buffer, Buffer, Buffer, Buffer) {
         let (nodes, instances, spheres) = build_trivial_scene();
         let bvh_node_buf      = Self::upload_slice(device, "BVH Nodes",      &nodes);
         let tlas_instance_buf = Self::upload_slice(device, "TLAS Instances", &instances);
         let sphere_buf        = Self::upload_slice(device, "Spheres",        &spheres);
-        (bvh_node_buf, tlas_instance_buf, sphere_buf)
+        let vertex_buf        = Self::upload_slice(device, "Vertices",       &[Vertex::zeroed()]);
+        let geometry_buf      = Self::upload_slice(device, "Geometry",       &[TriangleRecord::zeroed()]);
+        (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf)
     }
 
     fn create_ray_gen(
@@ -242,11 +252,13 @@ impl GpuState {
     }
 
     fn create_intersect(
-        device:           &Device,
-        ray_buf:          &Buffer,
-        bvh_node_buf:     &Buffer,
+        device:            &Device,
+        ray_buf:           &Buffer,
+        bvh_node_buf:      &Buffer,
         tlas_instance_buf: &Buffer,
-        sphere_buf:       &Buffer,
+        sphere_buf:        &Buffer,
+        vertex_buf:        &Buffer,
+        geometry_buf:      &Buffer,
         width:  u32,
         height: u32,
     ) -> (Texture, TextureView, ComputePipeline, BindGroup, BindGroup) {
@@ -262,7 +274,7 @@ impl GpuState {
         });
         let hdr_view = hdr_texture.create_view(&TextureViewDescriptor::default());
 
-        // BG0 — scene-global: BVH nodes, TLAS instances, spheres
+        // BG0 — scene-global: BVH nodes, TLAS instances, spheres, vertices, geometry
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Intersect BG0"),
             entries: &[
@@ -290,6 +302,22 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 3, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 4, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let scene_bg0 = device.create_bind_group(&BindGroupDescriptor {
@@ -298,6 +326,8 @@ impl GpuState {
                 BindGroupEntry { binding: 0, resource: bvh_node_buf.as_entire_binding() },
                 BindGroupEntry { binding: 1, resource: tlas_instance_buf.as_entire_binding() },
                 BindGroupEntry { binding: 2, resource: sphere_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: vertex_buf.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
             ],
         });
 

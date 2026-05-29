@@ -1,7 +1,6 @@
-# ltbl — Let There Be Light
+# beam — Brian's Extremely Amazing (rendering) Mechanism
 
-A WebGPU wavefront path-traced pinball game built in Rust/WASM.
-A pinball machine reimagined as a fully 3D playing field enclosed inside a glass egg, floating in space.
+A WebGPU wavefront path-tracer built in Rust/WASM.
 
 ## Current state
 
@@ -16,7 +15,7 @@ Wavefront compute pipeline rendering a normal-shaded analytic sphere via ray tra
 - [x] Step 3 — Ray generation kernel
 - [x] Step 4 — Analytic sphere intersection, normal shading, HDR pipeline
 - [x] Step 5 — BVH scaffold
-- [ ] Step 5.5 — Geometry buffer format (dual-material triangles)
+- [x] Step 5.5 — Geometry buffer format (dual-material triangles)
 - [ ] Step 6 — Material system
 - [ ] Step 7 — Next event estimation
 - [ ] Step 8 — Sky mask
@@ -39,7 +38,7 @@ Wavefront compute pipeline rendering a normal-shaded analytic sphere via ray tra
 
 ```bash
 ./build.sh
-# Open http://localhost:9000
+# Open http://localhost:9666
 ```
 
 **Prerequisites:** `rustup target add wasm32-unknown-unknown` and `cargo install wasm-pack basic-http-server`.
