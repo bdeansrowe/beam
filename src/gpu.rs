@@ -4,7 +4,7 @@ use std::rc::Rc;
 use wgpu::*;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::bvh::{build_trivial_scene, Vertex, TriangleRecord};
+use crate::bvh::{build_trivial_scene, Material, Vertex, TriangleRecord};
 
 // ── Camera uniform — mirrors WGSL `struct Camera` in ray_gen.wgsl ─────────────
 #[repr(C)]
@@ -60,6 +60,9 @@ pub struct GpuState {
     vertex_buf:   Buffer,
     #[allow(dead_code)]
     geometry_buf: Buffer,
+    // Material buffer (Step 6)
+    #[allow(dead_code)]
+    material_buf: Buffer,
 
     // Sphere intersection + HDR output (Step 4/5)
     #[allow(dead_code)]
@@ -138,14 +141,14 @@ impl GpuState {
         let (ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf) =
             Self::create_ray_gen(&device, size.width, size.height);
 
-        let (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf) =
+        let (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf, material_buf) =
             Self::create_bvh_buffers(&device);
 
         let (hdr_texture, hdr_view, intersect_pipeline, intersect_bg1, scene_bg0) =
             Self::create_intersect(
                 &device, &ray_buf,
                 &bvh_node_buf, &tlas_instance_buf, &sphere_buf,
-                &vertex_buf, &geometry_buf,
+                &vertex_buf, &geometry_buf, &material_buf,
                 size.width, size.height,
             ).await;
 
@@ -153,7 +156,7 @@ impl GpuState {
             Self::create_blit(&device, &config, &hdr_view);
 
         log::info!(
-            "Step 5.5 ready: {}×{} rays, geometry buffers online",
+            "Step 6 ready: {}×{} rays, material buffer online",
             size.width, size.height,
         );
 
@@ -161,7 +164,7 @@ impl GpuState {
             surface, device, queue, config, size,
             camera_buf, ray_buf, ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1,
             bvh_node_buf, tlas_instance_buf, sphere_buf,
-            vertex_buf, geometry_buf,
+            vertex_buf, geometry_buf, material_buf,
             hdr_texture, intersect_pipeline, intersect_bg1, scene_bg0,
             blit_pipeline, blit_bg0,
             frame: 0,
@@ -181,14 +184,15 @@ impl GpuState {
         buf
     }
 
-    fn create_bvh_buffers(device: &Device) -> (Buffer, Buffer, Buffer, Buffer, Buffer) {
+    fn create_bvh_buffers(device: &Device) -> (Buffer, Buffer, Buffer, Buffer, Buffer, Buffer) {
         let (nodes, instances, spheres) = build_trivial_scene();
         let bvh_node_buf      = Self::upload_slice(device, "BVH Nodes",      &nodes);
         let tlas_instance_buf = Self::upload_slice(device, "TLAS Instances", &instances);
         let sphere_buf        = Self::upload_slice(device, "Spheres",        &spheres);
         let vertex_buf        = Self::upload_slice(device, "Vertices",       &[Vertex::zeroed()]);
         let geometry_buf      = Self::upload_slice(device, "Geometry",       &[TriangleRecord::zeroed()]);
-        (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf)
+        let material_buf      = Self::upload_slice(device, "Materials",      &[Material::zeroed()]);
+        (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf, material_buf)
     }
 
     fn create_ray_gen(
@@ -261,6 +265,7 @@ impl GpuState {
         sphere_buf:        &Buffer,
         vertex_buf:        &Buffer,
         geometry_buf:      &Buffer,
+        material_buf:      &Buffer,
         width:  u32,
         height: u32,
     ) -> (Texture, TextureView, ComputePipeline, BindGroup, BindGroup) {
@@ -320,6 +325,14 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 5, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let scene_bg0 = device.create_bind_group(&BindGroupDescriptor {
@@ -330,6 +343,7 @@ impl GpuState {
                 BindGroupEntry { binding: 2, resource: sphere_buf.as_entire_binding() },
                 BindGroupEntry { binding: 3, resource: vertex_buf.as_entire_binding() },
                 BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
+                BindGroupEntry { binding: 5, resource: material_buf.as_entire_binding() },
             ],
         });
 

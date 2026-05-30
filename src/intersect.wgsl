@@ -43,6 +43,16 @@ struct TriangleRecord {
     _pad2:             u32,
 }  // 32 bytes
 
+struct Material {
+    base_color:    vec4<f32>,  // .rgb=color,     .w=unused
+    emission:      vec4<f32>,  // .rgb=emission,  .w=unused
+    absorption:    vec4<f32>,  // .rgb=Beer's law coefficient, .w=unused
+    material_type: u32,        // MaterialType discriminant — routes to shading kernel
+    ior:           f32,        // index of refraction (1.0 for opaque)
+    roughness:     f32,        // reserved; 0.0=smooth (reach goal)
+    _pad:          f32,
+}  // 64 bytes
+
 // ── Node type constants ───────────────────────────────────────────────────────
 const NODE_INTERNAL:      u32 = 0u;
 const NODE_LEAF_TRIANGLE: u32 = 1u;
@@ -59,6 +69,8 @@ const INVALID_NODE: u32 = 0xFFFFFFFFu;
 // Step 5.5 — declared, not yet used
 @group(0) @binding(3) var<storage, read> vertices       : array<Vertex>;
 @group(0) @binding(4) var<storage, read> geometry       : array<TriangleRecord>;
+// Step 6 — declared, not yet used
+@group(0) @binding(5) var<storage, read> materials      : array<Material>;
 
 // group(1) = per-pass resources (ray buffer, output texture)
 @group(1) @binding(0) var<storage, read> rays    : array<Ray>;

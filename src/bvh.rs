@@ -1,5 +1,33 @@
 use bytemuck::{Pod, Zeroable};
 
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MaterialType {
+    Diffuse  = 0,
+    Metallic = 1,
+    Glass    = 2,
+    Emissive = 3,
+}
+
+// SAFETY: MaterialType is #[repr(u32)] with unit variants only.
+// Memory layout is identical to u32 — no padding, no uninit bytes.
+unsafe impl Zeroable for MaterialType {}
+unsafe impl Pod     for MaterialType {}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct Material {
+    pub base_color:    [f32; 4],      // .rgb=color,     .w=unused
+    pub emission:      [f32; 4],      // .rgb=emission,  .w=unused
+    pub absorption:    [f32; 4],      // .rgb=Beer's law coefficient, .w=unused
+    pub material_type: MaterialType,  // routes to shading kernel dispatch
+    pub ior:           f32,           // index of refraction (1.0 for opaque)
+    pub roughness:     f32,           // reserved; 0.0=smooth (reach goal)
+    pub _pad:          f32,           // alignment padding
+}
+// 64 bytes total. Clean multiple of 16.
+// WGSL struct must mirror exactly — use vec4<f32> for [f32;4] fields.
+
 #[allow(dead_code)]
 pub const NODE_INTERNAL:      u32 = 0;
 #[allow(dead_code)]
