@@ -4,16 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ---
 
-## What is ltbl?
+## What is beam?
 
-**ltbl** ("Let There Be Light") is a WebGPU ray-traced pinball game built in Rust/WASM.
+**beam** is a WebGPU ray-tracer built in Rust/WASM. To support a 3D pinball machine game.
 A pinball machine reimagined as a fully 3D playing field enclosed inside a glass egg,
 floating in space. The player views the egg from outside. The egg is a Hügelschäffer egg
 — asymmetric, fat-end-down exterior for Fabergé egg aesthetics, fat-end-up interior for
 natural funnel toward drain and flippers.
-
-This project is also a live test case for the `parley` agentic development methodology —
-human-model co-authorship of design decisions before implementation.
 
 ---
 
@@ -27,9 +24,9 @@ human-model co-authorship of design decisions before implementation.
 wasm-pack build --target web --out-dir web/pkg --release
 
 # Serve only (after build)
-cd web && basic-http-server --addr 127.0.0.1:9000 .
+cd web && basic-http-server --addr 127.0.0.1:9666 .
 # or without basic-http-server:
-cd web && python3 -m http.server 9000
+cd web && python3 -m http.server 9666
 
 # Syntax/type check without WASM (fast feedback)
 cargo check
@@ -64,7 +61,18 @@ The following Markdown files in the repo root are design/context documents from 
   `web/` (index.html, pkg/) — this directory is the project root
 
 ---
+## Known Issues
 
+### Intermittent sphere miss on page load (pre-Step-5 origin)
+On some page loads the sphere fails to render despite all 
+buffers being correctly populated, the intersect kernel 
+firing, and all diagnostic checks passing. Mrays reads 
+~115 instead of ~28 on affected loads. Root cause not 
+identified after extensive investigation; suspected Dawn/
+Metal non-determinism on Chromium 148 / Apple M2. Reloading 
+resolves it. Does not affect rendering correctness when working.
+
+---
 ## Planned Rendering Architecture
 
 - **Algorithm:** Wavefront path tracing — separate compute kernels per stage, NOT megakernel
@@ -146,7 +154,7 @@ These caused problems during scaffold development and must be respected:
 ### Never Cull Back Faces
 The glass egg and glass obstacles are refractive — rays enter from outside (front faces)
 and exit from inside (back faces of the same geometry). Back-face culling would break
-nested dielectric medium tracking entirely. NEVER cull back faces for any geometry in ltbl.
+nested dielectric medium tracking entirely. NEVER cull back faces for any geometry in beam.
 
 ### Static vs Dynamic — Kinematic Switching
 - **Static geometry:** egg shell, fixed obstacles at rest, flippers at rest — BVH built
@@ -215,7 +223,7 @@ var stack: array<u32, 32>;  // node indices, 32 deep
 var stack_ptr: i32 = 0;
 ```
 
-32 entries is conservative headroom for ltbl's scene. Do not increase without profiling.
+32 entries is conservative headroom for beam's scene. Do not increase without profiling.
 
 ### TLAS Instance Layout
 
@@ -312,7 +320,7 @@ shading kernel. Large ray records increase memory bandwidth pressure across all 
 ### Medium Stack
 The medium stack tracks which refractive volumes a ray is currently inside — required for
 correct nested dielectric rendering of the glass egg and colored glass obstacles.
-- **Maximum depth: 4** (realistic maximum for ltbl geometry is 3, depth 4 is headroom)
+- **Maximum depth: 4** (realistic maximum for beam geometry is 3, depth 4 is headroom)
 - Each entry: material ID + IOR value (~8 bytes per entry = ~32 bytes for depth-4 stack)
 - Push on front-face hit (entering volume), pop on back-face hit (exiting volume)
 - Interior air is an explicit medium — the inner egg surface is its entry/exit boundary
@@ -416,7 +424,7 @@ Every spawned ray needs tmin epsilon — typically ~1e-4 in scene units.
 Any intersection closer than tmin from ray origin is ignored.
 This prevents floating point imprecision at ray origin from causing immediate re-hit
 of the surface just left — distinct from the modeling coincident-surface problem.
-Tune for ltbl's scene scale — too small: self-intersection artifacts; too large: misses
+Tune for beam's scene scale — too small: self-intersection artifacts; too large: misses
 legitimate nearby geometry in thin glass obstacles.
 See `ltbl_modeling_requirements.md` for related modeling constraints.
 

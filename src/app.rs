@@ -20,6 +20,8 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() { return; }
+
         let attrs = Window::default_attributes()
             .with_title("wgpu + WASM");
 

@@ -1,4 +1,4 @@
-# beam — Brian's Extremely Amazing (rendering) Mechanism
+# beam
 
 A WebGPU wavefront path-tracer built in Rust/WASM.
 
@@ -9,6 +9,15 @@ Wavefront compute pipeline rendering a normal-shaded analytic sphere via ray tra
 1. **Ray generation** — pinhole camera, Halton sub-pixel jitter, rays written to GPU storage buffer
 2. **Sphere intersection** — analytic quadratic solve against a single hardcoded sphere; hit pixels shaded by surface normal mapped to RGB
 3. **HDR pipeline** — compute writes to `rgba16float` storage texture; fullscreen blit pass reads it to canvas (clamp tonemapping, Khronos PBR Neutral in a later step)
+
+## Known Issues
+
+**Intermittent blank canvas on page load** — on some loads the
+sphere fails to render. Mrays will read ~115 instead of ~28.
+Reload until the sphere appears (usually 1–3 attempts). Root
+cause not identified; suspected Dawn/Metal non-determinism on
+Chromium 148 / Apple Silicon. Does not affect rendering
+correctness when working.
 
 ## Implementation Progress
 

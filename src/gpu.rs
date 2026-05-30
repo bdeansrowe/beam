@@ -91,6 +91,8 @@ impl GpuState {
             { window.inner_size() }
         };
 
+        log::info!("GpuState::new — canvas size: {}×{}", size.width, size.height);
+
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::BROWSER_WEBGPU,
             ..Default::default()
@@ -145,7 +147,7 @@ impl GpuState {
                 &bvh_node_buf, &tlas_instance_buf, &sphere_buf,
                 &vertex_buf, &geometry_buf,
                 size.width, size.height,
-            );
+            ).await;
 
         let (blit_pipeline, blit_bg0) =
             Self::create_blit(&device, &config, &hdr_view);
@@ -251,7 +253,7 @@ impl GpuState {
         (pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf)
     }
 
-    fn create_intersect(
+    async fn create_intersect(
         device:            &Device,
         ray_buf:           &Buffer,
         bvh_node_buf:      &Buffer,
@@ -363,15 +365,32 @@ impl GpuState {
         });
 
         let shader = device.create_shader_module(include_wgsl!("intersect.wgsl"));
+
+        // Dx: surface any WGSL compilation errors or warnings immediately
+        let comp_info = shader.get_compilation_info().await;
+        for msg in &comp_info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error =>
+                    log::error!("intersect.wgsl: {}", msg.message),
+                CompilationMessageType::Warning =>
+                    log::warn!("intersect.wgsl: {}", msg.message),
+                _ => {}
+            }
+        }
+
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("Intersect Layout"),
             bind_group_layouts: &[&bg0_layout, &bg1_layout],
             push_constant_ranges: &[],
         });
+        device.push_error_scope(ErrorFilter::Validation);
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("Intersect"), layout: Some(&layout), module: &shader,
             entry_point: Some("main"), compilation_options: Default::default(), cache: None,
         });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Intersect pipeline validation error: {:?}", err);
+        }
 
         (hdr_texture, hdr_view, pipeline, intersect_bg1, scene_bg0)
     }

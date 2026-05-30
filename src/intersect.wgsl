@@ -1,3 +1,4 @@
+// cache-bust: 1
 // ── Shared ray type ───────────────────────────────────────────────────────────
 struct Ray {
     origin:    vec4<f32>,  // .w = tmin
