@@ -37,7 +37,15 @@ cargo check
 **Prerequisites:** `cargo install wasm-pack basic-http-server` and `rustup target add wasm32-unknown-unknown`.
 
 ---
+## Agentic Session Protocol
 
+At the start of every implementation session, before
+writing any code, present a numbered plan of all
+intended steps and wait for approval before proceeding.
+This allows the human supervisor to review the full
+scope before any diffs land.
+
+---
 ## Session & Context Documents
 
 The following Markdown files in the repo root are design/context documents from `parley` sessions — read them for background, not for code conventions:
