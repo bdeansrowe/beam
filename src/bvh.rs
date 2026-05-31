@@ -88,6 +88,18 @@ pub struct TriangleRecord {
     pub _pad:              [u32; 3],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct HitRecord {
+    pub t:            f32,      // hit distance; f32::MAX = miss
+    pub prim_idx:     u32,      // sphere buffer index (Step 6b) — triangle index later
+    pub bary_uv:      [f32; 2], // barycentric u, v; unused for sphere hits
+    pub face_forward: u32,      // 1 = ray hit front face, 0 = back face
+    pub _pad:         [u32; 3], // 32 bytes total
+}
+// 32 bytes. Clean multiple of 16. WGSL struct must mirror exactly.
+// Miss sentinel: t == f32::MAX (bitcast<f32>(0x7f7fffffu)).
+
 pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
     let nodes = vec![
         // Node 0: BLAS leaf — unit sphere at origin, sphere_index=0

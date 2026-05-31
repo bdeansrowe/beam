@@ -7,5 +7,8 @@ web/pkg/
 # Node
 node_modules/
 
+# Rando Project Meta Files
+Various_n_Sundry/
+
 # OS
 .DS_Store

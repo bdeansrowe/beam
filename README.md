@@ -4,20 +4,38 @@ A WebGPU wavefront path-tracer built in Rust/WASM.
 
 ## Current state
 
-Wavefront compute pipeline rendering a normal-shaded analytic sphere via ray tracing:
+Wavefront compute pipeline rendering a Lambertian-shaded analytic
+sphere via ray tracing:
 
-1. **Ray generation** — pinhole camera, Halton sub-pixel jitter, rays written to GPU storage buffer
-2. **Sphere intersection** — analytic quadratic solve against a single hardcoded sphere; hit pixels shaded by surface normal mapped to RGB
-3. **HDR pipeline** — compute writes to `rgba16float` storage texture; fullscreen blit pass reads it to canvas (clamp tonemapping, Khronos PBR Neutral in a later step)
+1. **Ray generation** — pinhole camera, rays written to GPU storage
+   buffer
+2. **BVH traversal** — analytic quadratic sphere intersection, writes
+   one `HitRecord` per ray into a hit buffer; miss sentinel
+   `t = f32::MAX`
+3. **Diffuse shading** — reads hit buffer, evaluates Lambertian BRDF
+   against a hardcoded directional light, writes to HDR texture
+4. **Metallic shading** — reads hit buffer, perfect mirror stand-in
+   (environment color × base_color); no bounces yet
+5. **HDR pipeline** — fullscreen blit pass reads `rgba16float`
+   storage texture to canvas (Khronos PBR Neutral tonemapping in a
+   later step)
+
+Current scene: one orange diffuse sphere (`base_color=[0.9,0.4,0.1]`,
+`MaterialType::Diffuse`) lit from `normalize(1,1,1)`.
 
 ## Known Issues
 
 **Intermittent blank canvas on page load** — on some loads the
 sphere fails to render. Mrays will read ~115 instead of ~28.
-Reload until the sphere appears (usually 1–3 attempts). Root
-cause not identified; suspected Dawn/Metal non-determinism on
-Chromium 148 / Apple Silicon. Does not affect rendering
-correctness when working.
+The intermittent miss is pre-shading: the BVH traversal kernel
+fires (hence the elevated Mrays) but returns no hits, writing
+`F32_MAX` to all hit records. The shading kernels correctly skip
+all pixels. Background is written by the traversal kernel; the
+canvas is not blank from a pipeline error — the geometry simply
+isn't being found on that load. Reload until the sphere appears
+(usually 1–3 attempts). Root cause not identified; suspected
+Dawn/Metal non-determinism on Chromium 148 / Apple Silicon. Does
+not affect rendering correctness when working.
 
 ## Implementation Progress
 
@@ -25,7 +43,9 @@ correctness when working.
 - [x] Step 4 — Analytic sphere intersection, normal shading, HDR pipeline
 - [x] Step 5 — BVH scaffold
 - [x] Step 5.5 — Geometry buffer format (dual-material triangles)
-- [ ] Step 6 — Material system
+- [x] Step 6 — Material system buffer infrastructure
+- [x] Step 6b — Shading kernel split: diffuse + metallic pipelines,
+      hit record buffer, shade_common.wgsl utilities
 - [ ] Step 7 — Next event estimation
 - [ ] Step 8 — Sky mask
 - [ ] Step 9 — Temporal accumulation
@@ -50,7 +70,8 @@ correctness when working.
 # Open http://localhost:9666
 ```
 
-**Prerequisites:** `rustup target add wasm32-unknown-unknown` and `cargo install wasm-pack basic-http-server`.
+**Prerequisites:** `rustup target add wasm32-unknown-unknown` and
+`cargo install wasm-pack basic-http-server`.
 
 **Browser:** Vivaldi or Chrome 113+ required for WebGPU.
 

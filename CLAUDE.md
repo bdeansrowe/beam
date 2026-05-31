@@ -59,10 +59,11 @@ The following Markdown files in the repo root are design/context documents from 
 
 ## Current Technical State
 
-- Working Rust/WASM/WebGPU scaffold rendering a single RGB triangle in the browser
+- Working Rust/WASM/WebGPU scaffold rendering a Lambertian-shaded
+  analytic sphere via wavefront path tracing
 - **Stack:** Rust, wgpu 27, winit 0.30, wasm-bindgen, wasm-pack
-- **Render architecture:** Two-pass — compute pass → HDR storage texture, then tonemap
-  blit to canvas
+- **Render architecture:** Wavefront compute pipeline → HDR storage
+  texture → blit to canvas
 - **Dev server:** Simple HTTP server on port 9000
 - **Dev environment:** Vivaldi (Chromium 144) on ARM64 Mac (M2 MacBook Air, 10-core GPU)
 - **Project structure:** `src/` (lib.rs, app.rs, gpu.rs, shader.wgsl) and
@@ -71,14 +72,22 @@ The following Markdown files in the repo root are design/context documents from 
 ---
 ## Known Issues
 
-### Intermittent sphere miss on page load (pre-Step-5 origin)
-On some page loads the sphere fails to render despite all 
-buffers being correctly populated, the intersect kernel 
-firing, and all diagnostic checks passing. Mrays reads 
-~115 instead of ~28 on affected loads. Root cause not 
-identified after extensive investigation; suspected Dawn/
-Metal non-determinism on Chromium 148 / Apple M2. Reloading 
-resolves it. Does not affect rendering correctness when working.
+### Intermittent sphere miss on page load
+On some page loads the sphere fails to render and the canvas is
+blank. Mrays reads ~115 instead of ~28 on affected loads.
+
+**Failure mode (as of Step 6b):** The intermittent miss is
+pre-shading. The BVH traversal kernel fires (hence the elevated
+Mrays) but returns no hits, writing `F32_MAX` to all hit records.
+The shading kernels correctly skip all pixels — they are not the
+source of the blank canvas. The traversal kernel writes BACKGROUND
+for misses, so the canvas is dark blue, not undefined. The geometry
+simply isn't being found on that load.
+
+Root cause not identified after extensive investigation; suspected
+Dawn/Metal non-determinism on Chromium 148 / Apple M2. Reloading
+resolves it (usually 1–3 attempts). Does not affect rendering
+correctness when working.
 
 ---
 ## Planned Rendering Architecture
@@ -154,6 +163,54 @@ These caused problems during scaffold development and must be respected:
   coordinates (u,v) ONLY — normal interpolation and UV lookup deferred to shading kernel
 - Do NOT compute normals or material properties in traversal kernel — false economy,
   increases register pressure, hurts occupancy
+
+### Geometry Buffer Format (Step 5.5)
+
+Two new structs in `bvh.rs`. Both 32 bytes. Both `#[repr(C)]`,
+`Pod`, `Zeroable`.
+
+```rust
+pub struct Vertex {
+    pub position: [f32; 4],  // .xyz = position, .w = 0.0 (pad)
+    pub normal:   [f32; 4],  // .xyz = normal,   .w = 0.0 (pad)
+}
+// 32 bytes. [f32;4] not [f32;3] — WGSL vec3<f32> has 16-byte
+// alignment; [f32;4] keeps the struct a clean multiple of 16.
+
+pub struct TriangleRecord {
+    pub v0:                u32,  // index into vertex buffer
+    pub v1:                u32,
+    pub v2:                u32,
+    pub front_material_id: u32,
+    pub back_material_id:  u32,
+    pub _pad:              [u32; 3],
+}
+// 32 bytes. Both material IDs present on every triangle —
+// required for correct medium stack push/pop on ray entry/exit
+// through glass surfaces.
+```
+
+Add `vertex_buf` and `geometry_buf` to `GpuState`. Allocate both
+at startup with a minimal placeholder (one zeroed Vertex, one
+zeroed TriangleRecord). No rendering changes — this step is data
+structure and buffer allocation only.
+
+### Winding Order Convention — DO NOT CHANGE WITHOUT AUDITING
+
+All triangle geometry uses **counter-clockwise (CCW) winding order**
+as seen from the front face (standard WebGPU/glTF convention). The
+front face is the face whose outward normal points in the direction
+consistent with CCW vertex order.
+
+`HitRecord.face_forward == 1` means the ray struck the CCW (front)
+face; `== 0` means the CW (back) face.
+
+`TriangleRecord.front_material_id` corresponds to the CCW face;
+`back_material_id` corresponds to the CW face. Medium stack push/pop
+logic (entering vs. exiting a volume) depends entirely on this
+convention. Do NOT change winding order without auditing all
+face-orientation-dependent code: traversal kernel, shading kernels,
+and any geometry generation or import code.
 
 ---
 
@@ -262,37 +319,6 @@ instances. Do not add until there is actual non-identity geometry to test agains
 - Sphere primitives live in a separate sphere buffer (center + radius, fixed size)
 - Triangle primitives live in the geometry buffer (defined in Step 5.5)
 
-### Geometry Buffer Format (Step 5.5)
-
-Two new structs in `bvh.rs`. Both 32 bytes. Both `#[repr(C)]`,
-`Pod`, `Zeroable`.
-
-```rust
-pub struct Vertex {
-    pub position: [f32; 4],  // .xyz = position, .w = 0.0 (pad)
-    pub normal:   [f32; 4],  // .xyz = normal,   .w = 0.0 (pad)
-}
-// 32 bytes. [f32;4] not [f32;3] — WGSL vec3<f32> has 16-byte
-// alignment; [f32;4] keeps the struct a clean multiple of 16.
-
-pub struct TriangleRecord {
-    pub v0:                u32,  // index into vertex buffer
-    pub v1:                u32,
-    pub v2:                u32,
-    pub front_material_id: u32,
-    pub back_material_id:  u32,
-    pub _pad:              [u32; 3],
-}
-// 32 bytes. Both material IDs present on every triangle —
-// required for correct medium stack push/pop on ray entry/exit
-// through glass surfaces.
-```
-
-Add `vertex_buf` and `geometry_buf` to `GpuState`. Allocate both
-at startup with a minimal placeholder (one zeroed Vertex, one
-zeroed TriangleRecord). No rendering changes — this step is data
-structure and buffer allocation only.
-
 ---
 
 ## Wavefront Architecture — Key Principles
@@ -343,6 +369,89 @@ paths. Terminate paths before maximum bounce count when throughput is very low.
 Between wavefront stages, compact active rays into contiguous buffer before dispatch.
 Terminated paths (Russian roulette, escaped scene) are removed — every dispatched thread
 has live work. Required once ray attrition across bounces becomes significant.
+
+---
+
+## Hit Record Layout (Step 6b — Shading Split)
+
+Traversal kernel writes one `HitRecord` per ray into a hit buffer.
+Shading kernels read the hit buffer; they do not participate in traversal.
+
+```rust
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct HitRecord {
+    pub t:            f32,      // hit distance; f32::MAX = miss
+    pub prim_idx:     u32,      // triangle index into geometry_buf
+    pub bary_uv:      [f32; 2], // barycentric u, v (w = 1-u-v)
+    pub face_forward: u32,      // 1 = ray hit CCW (front) face, 0 = CW (back) face
+    pub _pad:         [u32; 3], // 32 bytes total
+}
+// 32 bytes. Clean multiple of 16.
+// Miss condition: t == f32::MAX. No special buffer entry needed.
+```
+
+Material ID is NOT stored in HitRecord. Derive it in the shading kernel:
+`TriangleRecord.front_material_id` if `face_forward == 1`, else
+`back_material_id`. Redundancy between HitRecord and TriangleRecord
+would create a maintenance hazard — keep the hit record minimal.
+
+`face_forward` semantics depend on the CCW winding order convention.
+See **Winding Order Convention** in Geometry Decisions above.
+
+---
+
+## Shading Kernels (Step 6b)
+
+### Naming Convention
+One WGSL file per material type, named `shade_<variant>.wgsl`
+where `<variant>` is the `MaterialType` enum variant in lowercase:
+
+- `shade_diffuse.wgsl`
+- `shade_metallic.wgsl`
+- `shade_glass.wgsl` (B04 or later)
+- `shade_emissive.wgsl` (when needed)
+
+Each shader gets its own compute pipeline and dispatch. Do NOT fold
+multiple material types into one shader.
+
+### Shared Utilities — shade_common.wgsl
+Common functions used across shading kernels live in `shade_common.wgsl`.
+This file is NOT a standalone compute shader — it is composed into each
+`shade_<variant>` pipeline at pipeline creation time via wgpu's shader
+module composition. It contains no entry point (`@compute` function).
+
+Candidates for `shade_common.wgsl`:
+- `hit_position(ray, t)` — reconstruct world-space hit point
+- `interpolate_normal(hit_record)` — fetch vertex normals, interpolate
+  via barycentrics, normalize
+- `cosine_weighted_hemisphere(normal, seed)` — diffuse sample direction
+- `offset_ray_origin(pos, normal)` — apply tmin epsilon in normal
+  direction to prevent self-intersection
+- Any other utility called by two or more shading kernels
+
+Do NOT put glass-specific utilities (Fresnel, Snell, medium stack ops)
+in `shade_common.wgsl` until glass is implemented. Add to common only
+when a second consumer exists.
+
+### RNG — Deterministic Hash, Not PRNG
+
+Shading kernels derive random values via `hash_u32(seed)` in
+`shade_common.wgsl`, where `seed` is derived from pixel index and
+bounce count. This is intentionally deterministic — the same seed
+always produces the same sample direction, giving bit-exact
+reproducibility across runs, platforms, and driver versions.
+
+This property is valuable for regression testing: a test that renders
+a known scene and compares pixel output will produce identical results
+across runs without any special setup. Plan integration tests with
+this in mind.
+
+Do NOT replace with a clock- or thread-seeded PRNG without considering
+the impact on reproducibility and regression testing. The long-term
+upgrade path is blue noise textures or a Halton sequence (see
+Temporal Accumulation section) — both of which can be made
+deterministic by design.
 
 ---
 
@@ -403,6 +512,74 @@ Implement AFTER uniform jitter pipeline is working correctly.
 
 ## Materials
 
+### Material Buffer (Step 6 — Buffer Infrastructure)
+
+Add `material_buf` to `GpuState`. Allocate at startup with a single
+zeroed placeholder entry via `upload_slice`. Add to BG0 at binding 5,
+following the established pattern (vertex_buf=3, geometry_buf=4,
+material_buf=5).
+
+Add a stub `@group(0) @binding(5)` declaration to `intersect.wgsl`,
+marked `// Step 6 — declared, not yet used`. The Dawn backend rejects
+a pipeline whose explicit layout declares bindings the shader doesn't
+declare. The shader catches up to the layout, not the other way around.
+
+#### MaterialType Enum
+
+```rust
+#[repr(u32)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MaterialType {
+    Diffuse  = 0,
+    Metallic = 1,  // conductor BSDFs — chrome ball, future metallic obstacles
+    Glass    = 2,
+    Emissive = 3,
+}
+
+// SAFETY: MaterialType is #[repr(u32)] with unit variants only.
+// Memory layout is identical to u32 — no padding, no uninit bytes.
+unsafe impl bytemuck::Zeroable for MaterialType {}
+unsafe impl bytemuck::Pod     for MaterialType {}
+```
+
+`Metallic` routes to the conductor/mirror shading kernel. `roughness=0.0`
+produces a perfect mirror; `roughness` is reserved for the "used universe"
+ball aesthetic (reach goal). Do NOT infer material type from field values
+— always use the discriminant to route to shading kernels.
+
+#### Material Struct
+
+```rust
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct Material {
+    pub base_color:    [f32; 4],      // .rgb=color, .w=unused
+    pub emission:      [f32; 4],      // .rgb=emission, .w=unused
+    pub absorption:    [f32; 4],      // .rgb=Beer's law coeff, .w=unused
+    pub material_type: MaterialType,  // routes to shading kernel dispatch
+    pub ior:           f32,           // index of refraction (1.0 for opaque)
+    pub roughness:     f32,           // reserved; 0.0=smooth (reach goal)
+    pub _pad:          f32,           // alignment padding
+}
+// 64 bytes total. Clean multiple of 16.
+// WGSL struct must mirror exactly — use vec4<f32> for [f32;4] fields.
+```
+
+`[f32; 4]` not `[f32; 3]` — WGSL `vec3<f32>` has 16-byte alignment;
+`[f32; 4]` keeps the struct a clean multiple of 16. Same constraint
+as `Vertex` and `TriangleRecord`.
+
+**Deferred:** `metallic: f32` field for continuous metallic blending
+omitted. `MaterialType::Metallic` is sufficient for the chrome ball.
+Add the field when partially-metallic obstacles require it.
+
+#### Material Sorting (Planned Optimization — Not This Step)
+Sort rays by `material_type` between traversal and shading kernels.
+Separate shading dispatches for: Diffuse, Metallic, Glass, Emissive.
+Reduces shading divergence. Implement after basic rendering works and
+profiling motivates it. The `MaterialType` enum makes the sort key
+unambiguous when the time comes.
+
 ### Glass BSDF (Dominant Material)
 - Fresnel calculation + Snell's law refraction + medium stack push/pop
 - Beer's law attenuation for colored glass: `throughput *= exp(-absorption * distance)`
@@ -412,17 +589,11 @@ Implement AFTER uniform jitter pipeline is working correctly.
   Splitting rays causes exponential explosion of ray count — always sample one path
 - Do NOT cull back faces — both face orientations required for correct refraction
 
-### Chrome Ball (Mirror)
-- Perfect specular mirror — delta function BRDF
+### Chrome Ball (Metallic Mirror)
+- `MaterialType::Metallic`, `roughness=0.0` — perfect specular mirror, delta function BRDF
 - Exact normal from analytic sphere: `normalize(hitPoint - center)`
 - **"Used universe" aesthetic (reach goal):** roughness/anisotropy variation as material
   parameters for scratched chrome character — no geometry changes required
-
-### Material Sorting (Planned Optimization)
-Sort rays by material type between traversal and shading kernels.
-Separate shading dispatches for: glass, chrome, emissive, environment.
-Reduces shading divergence — all threads in a dispatch evaluate same material.
-Implement after basic rendering works, when profiling motivates it.
 
 ---
 
