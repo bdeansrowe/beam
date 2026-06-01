@@ -68,9 +68,10 @@ pub struct GpuState {
     #[allow(dead_code)]
     hit_buf: Buffer,
 
-    // Shading pipelines (Step 6b)
+    // Shading pipelines (Step 6b/6d)
     shade_diffuse_pipeline:  ComputePipeline,
     shade_metallic_pipeline: ComputePipeline,
+    shade_glass_pipeline:    ComputePipeline,
     shade_scene_bg0:         BindGroup,
     shade_bg1:               BindGroup,
 
@@ -171,7 +172,7 @@ impl GpuState {
                 size.width, size.height,
             ).await;
 
-        let (shade_diffuse_pipeline, shade_metallic_pipeline, shade_scene_bg0, shade_bg1) =
+        let (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline, shade_scene_bg0, shade_bg1) =
             Self::create_shade_pipelines(
                 &device,
                 &ray_buf,
@@ -187,7 +188,7 @@ impl GpuState {
             Self::create_blit(&device, &config, &hdr_view);
 
         log::info!(
-            "Step 6c ready: {}×{} rays, sphere material ID live, diffuse + metallic online",
+            "Step 6d ready: {}×{} rays, glass BSDF online (Fresnel/Snell/Beer/medium-stack)",
             size.width, size.height,
         );
 
@@ -197,7 +198,7 @@ impl GpuState {
             bvh_node_buf, tlas_instance_buf, sphere_buf,
             vertex_buf, geometry_buf, material_buf,
             hit_buf,
-            shade_diffuse_pipeline, shade_metallic_pipeline, shade_scene_bg0, shade_bg1,
+            shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline, shade_scene_bg0, shade_bg1,
             hdr_texture, intersect_pipeline, intersect_bg1, scene_bg0,
             blit_pipeline, blit_bg0,
             frame: 0,
@@ -224,15 +225,28 @@ impl GpuState {
         let sphere_buf        = Self::upload_slice(device, "Spheres",        &spheres);
         let vertex_buf        = Self::upload_slice(device, "Vertices",       &[Vertex::zeroed()]);
         let geometry_buf      = Self::upload_slice(device, "Geometry",       &[TriangleRecord::zeroed()]);
-        let material_buf      = Self::upload_slice(device, "Materials", &[Material {
-            base_color:    [0.9, 0.4, 0.1, 0.0],
-            emission:      [0.0, 0.0, 0.0, 0.0],
-            absorption:    [0.0, 0.0, 0.0, 0.0],
-            material_type: MaterialType::Diffuse,
-            ior:           1.0,
-            roughness:     0.0,
-            _pad:          0.0,
-        }]);
+        let material_buf      = Self::upload_slice(device, "Materials", &[
+            // Index 0: air — medium-stack placeholder; never shaded directly.
+            Material {
+                base_color:    [0.0, 0.0, 0.0, 0.0],
+                emission:      [0.0, 0.0, 0.0, 0.0],
+                absorption:    [0.0, 0.0, 0.0, 0.0],
+                material_type: MaterialType::Diffuse,
+                ior:           1.0,
+                roughness:     0.0,
+                _pad:          0.0,
+            },
+            // Index 1: tinted glass sphere — visibility test.
+            Material {
+                base_color:    [0.2, 0.6, 1.0, 1.0],
+                emission:      [0.0, 0.0, 0.0, 0.0],
+                absorption:    [0.0, 0.0, 0.0, 0.0],
+                material_type: MaterialType::Glass,
+                ior:           1.5,
+                roughness:     0.0,
+                _pad:          0.0,
+            },
+        ]);
         (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf, material_buf)
     }
 
@@ -530,7 +544,7 @@ impl GpuState {
         geometry_buf: &Buffer,
         material_buf: &Buffer,
         hdr_view:     &TextureView,
-    ) -> (ComputePipeline, ComputePipeline, BindGroup, BindGroup) {
+    ) -> (ComputePipeline, ComputePipeline, ComputePipeline, BindGroup, BindGroup) {
         // BG0 — scene resources for shading (bindings 2-5; 0/1 are intersect-only)
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Shade BG0"),
@@ -603,7 +617,7 @@ impl GpuState {
                 BindGroupLayoutEntry {
                     binding: 2, visibility: ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
+                        ty: BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false, min_binding_size: None,
                     },
                     count: None,
@@ -624,9 +638,11 @@ impl GpuState {
         let shade_common  = include_str!("shade_common.wgsl");
         let diffuse       = include_str!("shade_diffuse.wgsl");
         let metallic      = include_str!("shade_metallic.wgsl");
+        let glass         = include_str!("shade_glass.wgsl");
 
         let diffuse_src  = format!("{}\n{}\n{}", common_common, shade_common, diffuse);
         let metallic_src = format!("{}\n{}\n{}", common_common, shade_common, metallic);
+        let glass_src    = format!("{}\n{}\n{}", common_common, shade_common, glass);
 
         let diffuse_module = device.create_shader_module(ShaderModuleDescriptor {
             label:  Some("Shade Diffuse"),
@@ -650,6 +666,19 @@ impl GpuState {
             match msg.message_type {
                 CompilationMessageType::Error   => log::error!("shade_metallic: {}", msg.message),
                 CompilationMessageType::Warning => log::warn!("shade_metallic: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let glass_module = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Shade Glass"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(glass_src)),
+        });
+        let glass_info = glass_module.get_compilation_info().await;
+        for msg in &glass_info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("shade_glass: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("shade_glass: {}",  msg.message),
                 _ => {}
             }
         }
@@ -678,7 +707,16 @@ impl GpuState {
             log::error!("Shade Metallic pipeline validation error: {:?}", err);
         }
 
-        (shade_diffuse_pipeline, shade_metallic_pipeline, shade_scene_bg0, shade_bg1)
+        device.push_error_scope(ErrorFilter::Validation);
+        let shade_glass_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Shade Glass"), layout: Some(&layout), module: &glass_module,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Shade Glass pipeline validation error: {:?}", err);
+        }
+
+        (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline, shade_scene_bg0, shade_bg1)
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -764,7 +802,22 @@ impl GpuState {
             );
         }
 
-        // 5. Blit HDR texture → canvas
+        // 5. Glass shading → HDR texture
+        {
+            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("Shade Glass"), timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.shade_glass_pipeline);
+            cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
+            cpass.set_bind_group(1, &self.shade_bg1, &[]);
+            cpass.dispatch_workgroups(
+                (self.size.width + 7) / 8,
+                (self.size.height + 7) / 8,
+                1,
+            );
+        }
+
+        // 6. Blit HDR texture → canvas
         {
             let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label:                    Some("Blit"),

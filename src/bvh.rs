@@ -148,8 +148,8 @@ pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
     let spheres = vec![
         Sphere {
             center_radius:     [0.0, 0.0, 0.0, 0.5],
-            front_material_id: 0,
-            back_material_id:  0,
+            front_material_id: 1,
+            back_material_id:  1,
             _pad:              [0; 2],
         },
     ];

@@ -20,7 +20,7 @@ const HASH_MUL_1: u32 = 0x68b31f7eu;  // PCG-derived bit-mixing constant
 // ── BG1 — per-pass resources ──────────────────────────────────────────────────
 @group(1) @binding(0) var<storage, read> hit_records: array<HitRecord>;
 @group(1) @binding(1) var                hdr_out    : texture_storage_2d<rgba16float, write>;
-@group(1) @binding(2) var<storage, read> rays       : array<Ray>;
+@group(1) @binding(2) var<storage, read_write> rays : array<Ray>;
 
 // ── hit_position ──────────────────────────────────────────────────────────────
 fn hit_position(ray: Ray, t: f32) -> vec3<f32> {
