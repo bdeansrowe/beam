@@ -6,11 +6,12 @@ A WebGPU wavefront path-tracer built in Rust/WASM.
 
 ## Current state
 
-Wavefront compute pipeline rendering a Lambertian-shaded analytic
-sphere via ray tracing:
+Wavefront compute pipeline rendering a clear glass analytic sphere via
+ray tracing:
 
-1. **Ray generation** — pinhole camera, rays written to GPU storage
-   buffer
+1. **Ray generation** — pinhole camera, Halton sub-pixel jitter, rays
+   written to GPU storage buffer; medium stack pre-seeded with air
+   (`IOR=1.0`)
 2. **BVH traversal** — analytic quadratic sphere intersection, writes
    one `HitRecord` per ray into a hit buffer; miss sentinel
    `t = f32::MAX`
@@ -18,12 +19,21 @@ sphere via ray tracing:
    against a hardcoded directional light, writes to HDR texture
 4. **Metallic shading** — reads hit buffer, perfect mirror stand-in
    (environment color × base_color); no bounces yet
-5. **HDR pipeline** — fullscreen blit pass reads `rgba16float`
+5. **Glass shading** — reads hit buffer, evaluates full dielectric BSDF:
+   Schlick Fresnel, Snell refraction, TIR detection, Russian roulette
+   reflect/refract selection, Beer's law absorption, medium stack
+   push/pop with write-back to ray buffer; single-bounce output is
+   throughput × base_color × background
+6. **HDR pipeline** — fullscreen blit pass reads `rgba16float`
    storage texture to canvas (Khronos PBR Neutral tonemapping in a
    later step)
 
-Current scene: one orange diffuse sphere (`base_color=[0.9,0.4,0.1]`,
-`MaterialType::Diffuse`) lit from `normalize(1,1,1)`.
+Current scene: one clear glass sphere (`MaterialType::Glass`,
+`IOR=1.5`, `base_color=[1,1,1]`, zero absorption). Air is material
+index 0; glass is material index 1. Single-bounce — refracted and
+reflected rays resolve to the background colour, so the sphere is
+transparent against the dark background. Magenta indicates a medium
+stack underflow (geometry error).
 
 ## Known Issues
 
@@ -51,6 +61,8 @@ not affect rendering correctness when working.
 - [x] Step 6c — Sphere material ID: Sphere expanded to 32 bytes with
       front/back material IDs; shading kernels read material from
       sphere buffer instead of hardcoded index
+- [x] Step 6d — Glass BSDF: Schlick Fresnel, Snell refraction, TIR,
+      medium stack push/pop, Beer's law; sphere is now clear glass
 - [ ] Step 7 — Next event estimation
 - [ ] Step 8 — Sky mask
 - [ ] Step 9 — Temporal accumulation

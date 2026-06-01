@@ -28,8 +28,10 @@ cd web && basic-http-server --addr 127.0.0.1:9666 .
 # or without basic-http-server:
 cd web && python3 -m http.server 9666
 
-# Syntax/type check without WASM (fast feedback)
-cargo check
+# Syntax/type check — ALWAYS use the WASM target:
+cargo check --target wasm32-unknown-unknown
+# The native target produces irrelevant Send/Sync errors from
+# Rc<Window> and is not a valid check for this project.
 ```
 
 **Browser:** Vivaldi or Chrome 113+ required for WebGPU. Open DevTools console for GPU errors.
@@ -42,8 +44,13 @@ cargo check
 At the start of every implementation session, before
 writing any code, present a numbered plan of all
 intended steps and wait for approval before proceeding.
-This allows the human supervisor to review the full
+This allows the co-author supervisors to review the full
 scope before any diffs land.
+
+Execute steps sequentially, one at a time. Run
+`cargo check --target wasm32-unknown-unknown` after
+each step before proceeding to the next. Do not
+parallelize steps or combine steps into a single edit.
 
 ---
 ## Session & Context Documents
@@ -694,5 +701,8 @@ is data structure definition only.
 
 ## Documentation
 
-Update README.md to reflect current state when completing each
-numbered implementation step.
+Before proposing a commit message, consider whether README.md
+needs updating to reflect the work just completed. There will
+not always be something to add, but if there is, include the
+README change in the same commit as the work that sparked it.
+Update README when completing each numbered implementation step.
