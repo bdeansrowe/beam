@@ -1,5 +1,7 @@
 # beam
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A WebGPU wavefront path-tracer built in Rust/WASM.
 
 ## Current state
@@ -80,3 +82,7 @@ not affect rendering correctness when working.
 ```bash
 cargo check --target wasm32-unknown-unknown
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
