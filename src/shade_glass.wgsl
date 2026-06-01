@@ -4,6 +4,15 @@
 
 @group(1) @binding(2) var<storage, read_write> rays: array<Ray>;
 
+// 2^32 / phi (golden ratio) — Knuth, Vol. 3.
+// Low-discrepancy bit-mixing constant for per-pixel RNG seeding.
+const FIBONACCI_HASH: u32 = 0x9e3779b9u;
+
+// Low 24 bits of hash output — float precision ceiling for
+// uniform [0,1) conversion.
+const HASH_FLOAT_MASK: u32 = 0x00ffffffu;
+const HASH_FLOAT_DIV:  f32 = 16777216.0; // 2^24
+
 // ── Schlick Fresnel approximation ─────────────────────────────────────────────
 // r0 computed via multiplication to avoid pow() with a potentially negative base.
 fn schlick(cos_theta: f32, n1: f32, n2: f32) -> f32 {
@@ -67,7 +76,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         // ── D3 — Schlick Fresnel + Russian roulette ────────────────────────────
         let F    = schlick(cos_theta, n1, n2);
-        let rand = f32(hash_u32(idx * 0x9e3779b9u + 1u) & 0x00ffffffu) / f32(0x01000000u);
+        let rand = f32(hash_u32(idx * FIBONACCI_HASH + 1u)
+                       & HASH_FLOAT_MASK) / HASH_FLOAT_DIV;
         if rand < F {
             out_dir    = reflect(ray.direction.xyz, normal);
             is_reflect = true;
