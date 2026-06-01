@@ -72,8 +72,9 @@ pub struct GpuState {
     shade_diffuse_pipeline:  ComputePipeline,
     shade_metallic_pipeline: ComputePipeline,
     shade_glass_pipeline:    ComputePipeline,
-    shade_scene_bg0:         BindGroup,
-    shade_bg1:               BindGroup,
+    shade_scene_bg0:          BindGroup,
+    shade_bg1_readonly:       BindGroup,  // diffuse + metallic: rays read-only
+    shade_bg1_readwrite:      BindGroup,  // glass: rays read-write
 
     // Sphere intersection + HDR output (Step 4/5)
     #[allow(dead_code)]
@@ -172,7 +173,8 @@ impl GpuState {
                 size.width, size.height,
             ).await;
 
-        let (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline, shade_scene_bg0, shade_bg1) =
+        let (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline,
+             shade_scene_bg0, shade_bg1_readonly, shade_bg1_readwrite) =
             Self::create_shade_pipelines(
                 &device,
                 &ray_buf,
@@ -198,7 +200,8 @@ impl GpuState {
             bvh_node_buf, tlas_instance_buf, sphere_buf,
             vertex_buf, geometry_buf, material_buf,
             hit_buf,
-            shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline, shade_scene_bg0, shade_bg1,
+            shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline,
+            shade_scene_bg0, shade_bg1_readonly, shade_bg1_readwrite,
             hdr_texture, intersect_pipeline, intersect_bg1, scene_bg0,
             blit_pipeline, blit_bg0,
             frame: 0,
@@ -236,9 +239,9 @@ impl GpuState {
                 roughness:     0.0,
                 _pad:          0.0,
             },
-            // Index 1: tinted glass sphere — visibility test.
+            // Index 1: clear glass sphere.
             Material {
-                base_color:    [0.2, 0.6, 1.0, 1.0],
+                base_color:    [1.0, 1.0, 1.0, 1.0],
                 emission:      [0.0, 0.0, 0.0, 0.0],
                 absorption:    [0.0, 0.0, 0.0, 0.0],
                 material_type: MaterialType::Glass,
@@ -544,7 +547,7 @@ impl GpuState {
         geometry_buf: &Buffer,
         material_buf: &Buffer,
         hdr_view:     &TextureView,
-    ) -> (ComputePipeline, ComputePipeline, ComputePipeline, BindGroup, BindGroup) {
+    ) -> (ComputePipeline, ComputePipeline, ComputePipeline, BindGroup, BindGroup, BindGroup) {
         // BG0 — scene resources for shading (bindings 2-5; 0/1 are intersect-only)
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Shade BG0"),
@@ -593,39 +596,58 @@ impl GpuState {
             ],
         });
 
-        // BG1 — per-pass: hit records (read-only), HDR output, rays (read-only)
-        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label:   Some("Shade BG1"),
+        // BG1 — per-pass: hit records (read-only), HDR output, rays.
+        // Two layouts: readonly for diffuse/metallic, readwrite for glass.
+        let bg1_shared_entries = |read_only: bool| -> [BindGroupLayoutEntry; 3] { [
+            BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::StorageTexture {
+                    access:         StorageTextureAccess::WriteOnly,
+                    format:         TextureFormat::Rgba16Float,
+                    view_dimension: TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only },
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            },
+        ]};
+
+        let readonly_entries  = bg1_shared_entries(true);
+        let readwrite_entries = bg1_shared_entries(false);
+
+        let bg1_readonly_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Shade BG1 Readonly"),
+            entries: &readonly_entries,
+        });
+        let bg1_readwrite_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Shade BG1 Readwrite"),
+            entries: &readwrite_entries,
+        });
+
+        let shade_bg1_readonly = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Shade BG1 Readonly"), layout: &bg1_readonly_layout,
             entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0, visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false, min_binding_size: None,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1, visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::StorageTexture {
-                        access:         StorageTextureAccess::WriteOnly,
-                        format:         TextureFormat::Rgba16Float,
-                        view_dimension: TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 2, visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false, min_binding_size: None,
-                    },
-                    count: None,
-                },
+                BindGroupEntry { binding: 0, resource: hit_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(hdr_view) },
+                BindGroupEntry { binding: 2, resource: ray_buf.as_entire_binding() },
             ],
         });
-        let shade_bg1 = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("Shade BG1"), layout: &bg1_layout,
+        let shade_bg1_readwrite = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Shade BG1 Readwrite"), layout: &bg1_readwrite_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: hit_buf.as_entire_binding() },
                 BindGroupEntry { binding: 1, resource: BindingResource::TextureView(hdr_view) },
@@ -683,15 +705,20 @@ impl GpuState {
             }
         }
 
-        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("Shade Layout"),
-            bind_group_layouts: &[&bg0_layout, &bg1_layout],
+        let readonly_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Shade Readonly Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_readonly_layout],
+            push_constant_ranges: &[],
+        });
+        let readwrite_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Shade Readwrite Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_readwrite_layout],
             push_constant_ranges: &[],
         });
 
         device.push_error_scope(ErrorFilter::Validation);
         let shade_diffuse_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: Some("Shade Diffuse"), layout: Some(&layout), module: &diffuse_module,
+            label: Some("Shade Diffuse"), layout: Some(&readonly_layout), module: &diffuse_module,
             entry_point: Some("main"), compilation_options: Default::default(), cache: None,
         });
         if let Some(err) = device.pop_error_scope().await {
@@ -700,7 +727,7 @@ impl GpuState {
 
         device.push_error_scope(ErrorFilter::Validation);
         let shade_metallic_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: Some("Shade Metallic"), layout: Some(&layout), module: &metallic_module,
+            label: Some("Shade Metallic"), layout: Some(&readonly_layout), module: &metallic_module,
             entry_point: Some("main"), compilation_options: Default::default(), cache: None,
         });
         if let Some(err) = device.pop_error_scope().await {
@@ -709,14 +736,15 @@ impl GpuState {
 
         device.push_error_scope(ErrorFilter::Validation);
         let shade_glass_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: Some("Shade Glass"), layout: Some(&layout), module: &glass_module,
+            label: Some("Shade Glass"), layout: Some(&readwrite_layout), module: &glass_module,
             entry_point: Some("main"), compilation_options: Default::default(), cache: None,
         });
         if let Some(err) = device.pop_error_scope().await {
             log::error!("Shade Glass pipeline validation error: {:?}", err);
         }
 
-        (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline, shade_scene_bg0, shade_bg1)
+        (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline,
+         shade_scene_bg0, shade_bg1_readonly, shade_bg1_readwrite)
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -779,7 +807,7 @@ impl GpuState {
             });
             cpass.set_pipeline(&self.shade_diffuse_pipeline);
             cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
-            cpass.set_bind_group(1, &self.shade_bg1, &[]);
+            cpass.set_bind_group(1, &self.shade_bg1_readonly, &[]);
             cpass.dispatch_workgroups(
                 (self.size.width + 7) / 8,
                 (self.size.height + 7) / 8,
@@ -794,7 +822,7 @@ impl GpuState {
             });
             cpass.set_pipeline(&self.shade_metallic_pipeline);
             cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
-            cpass.set_bind_group(1, &self.shade_bg1, &[]);
+            cpass.set_bind_group(1, &self.shade_bg1_readonly, &[]);
             cpass.dispatch_workgroups(
                 (self.size.width + 7) / 8,
                 (self.size.height + 7) / 8,
@@ -809,7 +837,7 @@ impl GpuState {
             });
             cpass.set_pipeline(&self.shade_glass_pipeline);
             cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
-            cpass.set_bind_group(1, &self.shade_bg1, &[]);
+            cpass.set_bind_group(1, &self.shade_bg1_readwrite, &[]);
             cpass.dispatch_workgroups(
                 (self.size.width + 7) / 8,
                 (self.size.height + 7) / 8,

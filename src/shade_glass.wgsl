@@ -2,6 +2,8 @@
 // Composed with shade_common.wgsl at pipeline creation: shade_common is prepended,
 // so all structs, bindings, and utility functions are already in scope here.
 
+@group(1) @binding(2) var<storage, read_write> rays: array<Ray>;
+
 // ── Schlick Fresnel approximation ─────────────────────────────────────────────
 // r0 computed via multiplication to avoid pow() with a potentially negative base.
 fn schlick(cos_theta: f32, n1: f32, n2: f32) -> f32 {

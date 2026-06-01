@@ -2,6 +2,8 @@
 // Composed with shade_common.wgsl at pipeline creation: shade_common is prepended,
 // so all structs, bindings, and utility functions are already in scope here.
 
+@group(1) @binding(2) var<storage, read> rays: array<Ray>;
+
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = textureDimensions(hdr_out);
