@@ -187,7 +187,7 @@ impl GpuState {
             Self::create_blit(&device, &config, &hdr_view);
 
         log::info!(
-            "Step 6b ready: {}×{} rays, shading split, diffuse + metallic online",
+            "Step 6c ready: {}×{} rays, sphere material ID live, diffuse + metallic online",
             size.width, size.height,
         );
 

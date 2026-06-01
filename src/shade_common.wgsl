@@ -19,8 +19,11 @@ struct HitRecord {
 }
 
 struct Sphere {
-    center_radius: vec4<f32>,  // .xyz=center  .w=radius
-}
+    center_radius:     vec4<f32>,  // .xyz=center  .w=radius
+    front_material_id: u32,
+    back_material_id:  u32,
+    _pad:              vec2<u32>,
+}  // 32 bytes
 
 struct Vertex {
     position: vec4<f32>,

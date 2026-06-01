@@ -67,7 +67,10 @@ pub struct TlasInstance {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct Sphere {
-    pub center_radius: [f32; 4],  // .xyz=center, .w=radius
+    pub center_radius:     [f32; 4],  // .xyz=center, .w=radius
+    pub front_material_id: u32,       // CCW outward-normal face (ray entering sphere)
+    pub back_material_id:  u32,       // CW inward-normal face  (ray exiting sphere)
+    pub _pad:              [u32; 2],  // 32 bytes total
 }
 
 #[repr(C)]
@@ -126,7 +129,12 @@ pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
     ];
 
     let spheres = vec![
-        Sphere { center_radius: [0.0, 0.0, 0.0, 0.5] },
+        Sphere {
+            center_radius:     [0.0, 0.0, 0.0, 0.5],
+            front_material_id: 0,
+            back_material_id:  0,
+            _pad:              [0; 2],
+        },
     ];
 
     (nodes, instances, spheres)

@@ -24,8 +24,11 @@ struct TlasInstance {
 }  // 80 bytes
 
 struct Sphere {
-    center_radius: vec4<f32>,  // .xyz=center  .w=radius
-}  // 16 bytes
+    center_radius:     vec4<f32>,  // .xyz=center  .w=radius
+    front_material_id: u32,
+    back_material_id:  u32,
+    _pad:              vec2<u32>,
+}  // 32 bytes
 
 struct Vertex {
     position: vec4<f32>,  // .xyz=position  .w=0.0

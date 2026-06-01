@@ -14,8 +14,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Skip misses and non-metallic hits.
     if hit.t >= F32_MAX { return; }
-    // Step 6b — sphere material hardcoded to index 0; see B04 parley
-    let mat = materials[0u];
+    let mat_id = select(spheres[hit.prim_idx].back_material_id,
+                        spheres[hit.prim_idx].front_material_id,
+                        hit.face_forward == 1u);
+    let mat = materials[mat_id];
     if mat.material_type != MAT_METALLIC { return; }
 
     let ray    = rays[idx];

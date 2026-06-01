@@ -48,6 +48,9 @@ not affect rendering correctness when working.
 - [x] Step 6 — Material system buffer infrastructure
 - [x] Step 6b — Shading kernel split: diffuse + metallic pipelines,
       hit record buffer, shade_common.wgsl utilities
+- [x] Step 6c — Sphere material ID: Sphere expanded to 32 bytes with
+      front/back material IDs; shading kernels read material from
+      sphere buffer instead of hardcoded index
 - [ ] Step 7 — Next event estimation
 - [ ] Step 8 — Sky mask
 - [ ] Step 9 — Temporal accumulation
