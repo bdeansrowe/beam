@@ -1,5 +1,22 @@
 use bytemuck::{Pod, Zeroable};
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct MediumEntry {
+    pub material_id: u32,
+    pub ior:         f32,
+}  // 8 bytes
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct Ray {
+    pub origin:       [f32; 4],         // 16 bytes
+    pub direction:    [f32; 4],         // 16 bytes
+    pub medium_stack: [MediumEntry; 4], // 32 bytes
+    pub medium_depth: u32,              // 4 bytes
+    pub _pad:         [u32; 3],         // 12 bytes → 80 bytes total
+}
+
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MaterialType {

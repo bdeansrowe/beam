@@ -4,7 +4,7 @@ use std::rc::Rc;
 use wgpu::*;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::bvh::{build_trivial_scene, HitRecord, Material, MaterialType, Vertex, TriangleRecord};
+use crate::bvh::{build_trivial_scene, HitRecord, Material, MaterialType, Ray, Vertex, TriangleRecord};
 
 // ── Camera uniform — mirrors WGSL `struct Camera` in ray_gen.wgsl ─────────────
 #[repr(C)]
@@ -270,7 +270,7 @@ impl GpuState {
         });
         let ray_buf = device.create_buffer(&BufferDescriptor {
             label: Some("Ray Buffer"),
-            size:  (width * height * 32) as u64,
+            size:  (width * height) as u64 * std::mem::size_of::<Ray>() as u64,
             usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -284,7 +284,11 @@ impl GpuState {
             entries: &[BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() }],
         });
 
-        let shader = device.create_shader_module(include_wgsl!("ray_gen.wgsl"));
+        let ray_gen_src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("ray_gen.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Ray Gen"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(ray_gen_src)),
+        });
         let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("Ray Gen Layout"),
             bind_group_layouts: &[&bg0_layout, &bg1_layout],
@@ -429,7 +433,11 @@ impl GpuState {
             ],
         });
 
-        let shader = device.create_shader_module(include_wgsl!("intersect.wgsl"));
+        let intersect_src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("intersect.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Intersect"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(intersect_src)),
+        });
 
         // Dx: surface any WGSL compilation errors or warnings immediately
         let comp_info = shader.get_compilation_info().await;
@@ -611,13 +619,14 @@ impl GpuState {
             ],
         });
 
-        // Compose shade_common.wgsl + shade_<variant>.wgsl
-        let common   = include_str!("shade_common.wgsl");
-        let diffuse  = include_str!("shade_diffuse.wgsl");
-        let metallic = include_str!("shade_metallic.wgsl");
+        // Compose common_common.wgsl + shade_common.wgsl + shade_<variant>.wgsl
+        let common_common = include_str!("common_common.wgsl");
+        let shade_common  = include_str!("shade_common.wgsl");
+        let diffuse       = include_str!("shade_diffuse.wgsl");
+        let metallic      = include_str!("shade_metallic.wgsl");
 
-        let diffuse_src  = format!("{}\n{}", common, diffuse);
-        let metallic_src = format!("{}\n{}", common, metallic);
+        let diffuse_src  = format!("{}\n{}\n{}", common_common, shade_common, diffuse);
+        let metallic_src = format!("{}\n{}\n{}", common_common, shade_common, metallic);
 
         let diffuse_module = device.create_shader_module(ShaderModuleDescriptor {
             label:  Some("Shade Diffuse"),

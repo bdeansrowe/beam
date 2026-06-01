@@ -1,10 +1,3 @@
-// Ray record: vec4 packing avoids vec3 alignment surprises.
-// .w carries tmin (origin) and tmax (direction).
-struct Ray {
-    origin:    vec4<f32>,
-    direction: vec4<f32>,
-}
-
 // Mirrors CameraUniform in gpu.rs — layout must stay in sync.
 struct Camera {
     origin:     vec4<f32>,
@@ -35,10 +28,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dir = normalize(img_plane_pos - camera.origin.xyz);
 
     let idx = py * w + px;
-    rays[idx] = Ray(
-        vec4<f32>(camera.origin.xyz, 1e-4),
-        vec4<f32>(dir, 1e30),
-    );
+    var r: Ray;
+    r.origin             = vec4<f32>(camera.origin.xyz, 1e-4);
+    r.direction          = vec4<f32>(dir, 1e30);
+    r.medium_stack[0]    = MediumEntry(0u, 1.0);  // air
+    r.medium_depth       = 1u;
+    rays[idx] = r;
 }
 
 // Radical-inverse Halton sequence for sub-pixel jitter.

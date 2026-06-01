@@ -1,66 +1,13 @@
 // shade_common.wgsl — shared declarations and utilities for all shading kernels.
 // NOT a standalone compute shader — no @compute entry point.
 // Composed into each shade_<variant>.wgsl via string concatenation at pipeline creation.
+// common_common.wgsl is prepended before this file — all shared structs and constants
+// (Ray, HitRecord, Material, Sphere, Vertex, TriangleRecord, F32_MAX, PI, MAT_*,
+// BACKGROUND) are already in scope.
 
-// ── Structs ───────────────────────────────────────────────────────────────────
-struct Ray {
-    origin:    vec4<f32>,  // .w = tmin
-    direction: vec4<f32>,  // .w = tmax
-}
-
-struct HitRecord {
-    t:            f32,
-    prim_idx:     u32,
-    bary_uv:      vec2<f32>,
-    face_forward: u32,
-    _pad0:        u32,
-    _pad1:        u32,
-    _pad2:        u32,
-}
-
-struct Sphere {
-    center_radius:     vec4<f32>,  // .xyz=center  .w=radius
-    front_material_id: u32,
-    back_material_id:  u32,
-    _pad:              vec2<u32>,
-}  // 32 bytes
-
-struct Vertex {
-    position: vec4<f32>,
-    normal:   vec4<f32>,
-}
-
-struct TriangleRecord {
-    v0:                u32,
-    v1:                u32,
-    v2:                u32,
-    front_material_id: u32,
-    back_material_id:  u32,
-    _pad0:             u32,
-    _pad1:             u32,
-    _pad2:             u32,
-}
-
-struct Material {
-    base_color:    vec4<f32>,
-    emission:      vec4<f32>,
-    absorption:    vec4<f32>,
-    material_type: u32,
-    ior:           f32,
-    roughness:     f32,
-    _pad:          f32,
-}
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-const F32_MAX:      f32       = bitcast<f32>(0x7f7fffffu);
-const PI:           f32       = 3.14159265358979323846;
-const MAT_DIFFUSE:  u32       = 0u;
-const MAT_METALLIC: u32       = 1u;
-const MAT_GLASS:    u32       = 2u;
-const MAT_EMISSIVE: u32       = 3u;
-const BACKGROUND:   vec4<f32> = vec4<f32>(0.05, 0.05, 0.1, 1.0);
-const HASH_MUL_0:   u32       = 0xbf324c81u;  // PCG-derived bit-mixing constant
-const HASH_MUL_1:   u32       = 0x68b31f7eu;  // PCG-derived bit-mixing constant
+// ── Shade-local constants ─────────────────────────────────────────────────────
+const HASH_MUL_0: u32 = 0xbf324c81u;  // PCG-derived bit-mixing constant
+const HASH_MUL_1: u32 = 0x68b31f7eu;  // PCG-derived bit-mixing constant
 
 // ── BG0 — scene resources used by shading kernels ─────────────────────────────
 // Bindings 0 (bvh_nodes) and 1 (tlas_instances) are intersect-only — not declared here.

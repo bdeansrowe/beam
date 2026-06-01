@@ -1,10 +1,4 @@
-// cache-bust: 2
-// ── Shared ray type ───────────────────────────────────────────────────────────
-struct Ray {
-    origin:    vec4<f32>,  // .w = tmin
-    direction: vec4<f32>,  // .w = tmax
-}
-
+// cache-bust: 3
 // ── BVH scene types — must mirror Rust structs in bvh.rs exactly ─────────────
 struct BvhNode {
     aabb_min_left_start:  vec4<f32>,  // .xyz=aabb_min  .w=left_child|prim_start|sphere_index (bits)
@@ -23,57 +17,12 @@ struct TlasInstance {
     _r1:         u32,
 }  // 80 bytes
 
-struct Sphere {
-    center_radius:     vec4<f32>,  // .xyz=center  .w=radius
-    front_material_id: u32,
-    back_material_id:  u32,
-    _pad:              vec2<u32>,
-}  // 32 bytes
-
-struct Vertex {
-    position: vec4<f32>,  // .xyz=position  .w=0.0
-    normal:   vec4<f32>,  // .xyz=normal    .w=0.0
-}  // 32 bytes
-
-struct TriangleRecord {
-    v0:                u32,
-    v1:                u32,
-    v2:                u32,
-    front_material_id: u32,
-    back_material_id:  u32,
-    _pad0:             u32,
-    _pad1:             u32,
-    _pad2:             u32,
-}  // 32 bytes
-
-struct Material {
-    base_color:    vec4<f32>,
-    emission:      vec4<f32>,
-    absorption:    vec4<f32>,
-    material_type: u32,
-    ior:           f32,
-    roughness:     f32,
-    _pad:          f32,
-}  // 64 bytes
-
-// ── Hit record — mirrors HitRecord in bvh.rs exactly (32 bytes) ──────────────
-struct HitRecord {
-    t:            f32,
-    prim_idx:     u32,
-    bary_uv:      vec2<f32>,
-    face_forward: u32,
-    _pad0:        u32,
-    _pad1:        u32,
-    _pad2:        u32,
-}
-
 // ── Node type constants ───────────────────────────────────────────────────────
 const NODE_INTERNAL:      u32 = 0u;
 const NODE_LEAF_TRIANGLE: u32 = 1u;
 const NODE_LEAF_SPHERE:   u32 = 2u;
 const NODE_LEAF_QUARTIC:  u32 = 3u;
 const INVALID_NODE:       u32 = 0xFFFFFFFFu;
-const F32_MAX:            f32 = bitcast<f32>(0x7f7fffffu);
 
 // ── Bindings ──────────────────────────────────────────────────────────────────
 // group(0) = scene-global resources (BVH, geometry, materials)
@@ -90,9 +39,6 @@ const F32_MAX:            f32 = bitcast<f32>(0x7f7fffffu);
 @group(1) @binding(0) var<storage, read>       rays        : array<Ray>;
 @group(1) @binding(1) var                      hdr_out     : texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var<storage, read_write> hit_records : array<HitRecord>;
-
-// ── Constants ─────────────────────────────────────────────────────────────────
-const BACKGROUND: vec4<f32> = vec4<f32>(0.05, 0.05, 0.1, 1.0);
 
 // ── Named .w-field accessors — never access .w directly in traversal code ─────
 fn node_left_child(node:   BvhNode) -> u32 { return bitcast<u32>(node.aabb_min_left_start.w); }
