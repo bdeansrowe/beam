@@ -1,29 +1,3 @@
-// cache-bust: 3
-// ── BVH scene types — must mirror Rust structs in bvh.rs exactly ─────────────
-struct BvhNode {
-    aabb_min_left_start:  vec4<f32>,  // .xyz=aabb_min  .w=left_child|prim_start|sphere_index (bits)
-    aabb_max_right_count: vec4<f32>,  // .xyz=aabb_max  .w=right_child|prim_count|unused (bits)
-    node_type:            u32,
-    _r0:                  u32,
-    _r1:                  u32,
-    _r2:                  u32,
-}  // 48 bytes
-
-struct TlasInstance {
-    transform:   mat4x4<f32>,  // 64 bytes, column-major — world transform (object→world)
-    blas_offset: u32,
-    flags:       u32,
-    _r0:         u32,
-    _r1:         u32,
-}  // 80 bytes
-
-// ── Node type constants ───────────────────────────────────────────────────────
-const NODE_INTERNAL:      u32 = 0u;
-const NODE_LEAF_TRIANGLE: u32 = 1u;
-const NODE_LEAF_SPHERE:   u32 = 2u;
-const NODE_LEAF_QUARTIC:  u32 = 3u;
-const INVALID_NODE:       u32 = 0xFFFFFFFFu;
-
 // ── Bindings ──────────────────────────────────────────────────────────────────
 // group(0) = scene-global resources (BVH, geometry, materials)
 @group(0) @binding(0) var<storage, read> bvh_nodes      : array<BvhNode>;
@@ -34,44 +8,13 @@ const INVALID_NODE:       u32 = 0xFFFFFFFFu;
 @group(0) @binding(4) var<storage, read> geometry       : array<TriangleRecord>;
 // Step 6 — declared, not yet used
 @group(0) @binding(5) var<storage, read> materials      : array<Material>;
+// Step 7 — declared, not yet used
+@group(0) @binding(6) var<storage, read> lights         : array<LightUniform>;
 
 // group(1) = per-pass resources
 @group(1) @binding(0) var<storage, read>       rays        : array<Ray>;
-@group(1) @binding(1) var                      hdr_out     : texture_storage_2d<rgba16float, write>;
+@group(1) @binding(1) var                      accum_buf   : texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var<storage, read_write> hit_records : array<HitRecord>;
-
-// ── Named .w-field accessors — never access .w directly in traversal code ─────
-fn node_left_child(node:   BvhNode) -> u32 { return bitcast<u32>(node.aabb_min_left_start.w); }
-fn node_prim_start(node:   BvhNode) -> u32 { return bitcast<u32>(node.aabb_min_left_start.w); }
-fn node_sphere_index(node: BvhNode) -> u32 { return bitcast<u32>(node.aabb_min_left_start.w); }
-fn node_right_child(node:  BvhNode) -> u32 { return bitcast<u32>(node.aabb_max_right_count.w); }
-fn node_prim_count(node:   BvhNode) -> u32 { return bitcast<u32>(node.aabb_max_right_count.w); }
-
-// ── AABB slab test ────────────────────────────────────────────────────────────
-fn aabb_hit(node: BvhNode, origin: vec3<f32>, inv_dir: vec3<f32>, tmin: f32, tmax: f32) -> bool {
-    let t0 = (node.aabb_min_left_start.xyz  - origin) * inv_dir;
-    let t1 = (node.aabb_max_right_count.xyz - origin) * inv_dir;
-    let tenter = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
-    let texit  = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
-    return tenter <= texit && texit >= tmin && tenter <= tmax;
-}
-
-// ── Analytic sphere intersection (quadratic, half-b form) ─────────────────────
-// Returns hit t > 0, or -1.0 on miss.
-fn sphere_hit(sph: Sphere, origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32) -> f32 {
-    let oc = origin - sph.center_radius.xyz;
-    let a  = dot(dir, dir);
-    let h  = dot(oc, dir);
-    let c  = dot(oc, oc) - sph.center_radius.w * sph.center_radius.w;
-    let discriminant = h * h - a * c;
-    if discriminant < 0.0 { return -1.0; }
-    let sq = sqrt(discriminant);
-    let t1 = (-h - sq) / a;
-    if t1 >= tmin && t1 <= tmax { return t1; }
-    let t2 = (-h + sq) / a;
-    if t2 >= tmin && t2 <= tmax { return t2; }
-    return -1.0;
-}
 
 // ── BVH traversal — writes one HitRecord per ray into hit_records[idx] ────────
 // Internal state uses anonymous locals; the old traversal-local HitRecord struct
@@ -140,7 +83,7 @@ fn traverse_bvh(origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32, idx: u3
 // ── Main ──────────────────────────────────────────────────────────────────────
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(hdr_out);
+    let dims = textureDimensions(accum_buf);
     let px = gid.x;
     let py = gid.y;
     if px >= dims.x || py >= dims.y { return; }
@@ -158,6 +101,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Misses: write background. Hit pixels are written by shading kernels.
     if hit_records[idx].t >= F32_MAX {
-        textureStore(hdr_out, vec2<i32>(i32(px), i32(py)), BACKGROUND);
+        textureStore(accum_buf, vec2<i32>(i32(px), i32(py)), BACKGROUND);
     }
 }

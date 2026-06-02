@@ -59,10 +59,75 @@ struct Sphere {
     _pad:              vec2<u32>,
 }  // 32 bytes
 
+// ── BVH types — must mirror Rust structs in bvh.rs exactly ───────────────────
+struct BvhNode {
+    aabb_min_left_start:  vec4<f32>,  // .xyz=aabb_min  .w=left_child|prim_start|sphere_index (bits)
+    aabb_max_right_count: vec4<f32>,  // .xyz=aabb_max  .w=right_child|prim_count|unused (bits)
+    node_type:            u32,
+    _r0:                  u32,
+    _r1:                  u32,
+    _r2:                  u32,
+}  // 48 bytes
+
+struct TlasInstance {
+    transform:   mat4x4<f32>,  // 64 bytes, column-major
+    blas_offset: u32,
+    flags:       u32,
+    _r0:         u32,
+    _r1:         u32,
+}  // 80 bytes
+
+// ── Node type constants ───────────────────────────────────────────────────────
+const NODE_INTERNAL:      u32 = 0u;
+const NODE_LEAF_TRIANGLE: u32 = 1u;
+const NODE_LEAF_SPHERE:   u32 = 2u;
+const NODE_LEAF_QUARTIC:  u32 = 3u;
+const INVALID_NODE:       u32 = 0xFFFFFFFFu;
+
+// ── Named .w-field accessors ──────────────────────────────────────────────────
+fn node_left_child(node:   BvhNode) -> u32 { return bitcast<u32>(node.aabb_min_left_start.w); }
+fn node_prim_start(node:   BvhNode) -> u32 { return bitcast<u32>(node.aabb_min_left_start.w); }
+fn node_sphere_index(node: BvhNode) -> u32 { return bitcast<u32>(node.aabb_min_left_start.w); }
+fn node_right_child(node:  BvhNode) -> u32 { return bitcast<u32>(node.aabb_max_right_count.w); }
+fn node_prim_count(node:   BvhNode) -> u32 { return bitcast<u32>(node.aabb_max_right_count.w); }
+
+// ── AABB slab test ────────────────────────────────────────────────────────────
+fn aabb_hit(node: BvhNode, origin: vec3<f32>, inv_dir: vec3<f32>, tmin: f32, tmax: f32) -> bool {
+    let t0 = (node.aabb_min_left_start.xyz  - origin) * inv_dir;
+    let t1 = (node.aabb_max_right_count.xyz - origin) * inv_dir;
+    let tenter = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let texit  = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    return tenter <= texit && texit >= tmin && tenter <= tmax;
+}
+
+// ── Analytic sphere intersection (quadratic, half-b form) ─────────────────────
+// Returns near hit t >= tmin, or -1.0 on miss.
+fn sphere_hit(sph: Sphere, origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32) -> f32 {
+    let oc = origin - sph.center_radius.xyz;
+    let a  = dot(dir, dir);
+    let h  = dot(oc, dir);
+    let c  = dot(oc, oc) - sph.center_radius.w * sph.center_radius.w;
+    let discriminant = h * h - a * c;
+    if discriminant < 0.0 { return -1.0; }
+    let sq = sqrt(discriminant);
+    let t1 = (-h - sq) / a;
+    if t1 >= tmin && t1 <= tmax { return t1; }
+    let t2 = (-h + sq) / a;
+    if t2 >= tmin && t2 <= tmax { return t2; }
+    return -1.0;
+}
+
+struct LightUniform {
+    position:  vec4<f32>,
+    color:     vec4<f32>,
+    intensity: f32,
+    _pad:      vec3<f32>,
+}  // 48 bytes
+
 const F32_MAX:      f32       = bitcast<f32>(0x7f7fffffu);
 const PI:           f32       = 3.14159265358979323846;
 const MAT_DIFFUSE:  u32       = 0u;
 const MAT_METALLIC: u32       = 1u;
 const MAT_GLASS:    u32       = 2u;
 const MAT_EMISSIVE: u32       = 3u;
-const BACKGROUND:   vec4<f32> = vec4<f32>(0.05, 0.05, 0.1, 1.0);
+const BACKGROUND:   vec4<f32> = vec4<f32>(0.45, 0.42, 0.38, 1.0);

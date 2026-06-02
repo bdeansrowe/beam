@@ -6,34 +6,34 @@ A WebGPU wavefront path-tracer built in Rust/WASM.
 
 ## Current state
 
-Wavefront compute pipeline rendering a clear glass analytic sphere via
-ray tracing:
+Wavefront compute pipeline rendering two analytic spheres with direct
+point lighting via Next Event Estimation:
 
 1. **Ray generation** — pinhole camera, Halton sub-pixel jitter, rays
    written to GPU storage buffer; medium stack pre-seeded with air
    (`IOR=1.0`)
-2. **BVH traversal** — analytic quadratic sphere intersection, writes
-   one `HitRecord` per ray into a hit buffer; miss sentinel
-   `t = f32::MAX`
-3. **Diffuse shading** — reads hit buffer, evaluates Lambertian BRDF
-   against a hardcoded directional light, writes to HDR texture
-4. **Metallic shading** — reads hit buffer, perfect mirror stand-in
-   (environment color × base_color); no bounces yet
-5. **Glass shading** — reads hit buffer, evaluates full dielectric BSDF:
-   Schlick Fresnel, Snell refraction, TIR detection, Russian roulette
-   reflect/refract selection, Beer's law absorption, medium stack
-   push/pop with write-back to ray buffer; single-bounce output is
-   throughput × base_color × background
-6. **HDR pipeline** — fullscreen blit pass reads `rgba16float`
-   storage texture to canvas (Khronos PBR Neutral tonemapping in a
-   later step)
+2. **BVH traversal** — quadratic sphere intersection, writes one
+   `HitRecord` per ray; miss sentinel `t = f32::MAX`; background
+   written to `accum_buf`
+3. **Diffuse shading** — Lambertian stand-in (hardcoded directional);
+   superseded per-pixel by the direct lighting kernel
+4. **Metallic shading** — perfect mirror stand-in
+5. **Glass shading** — full dielectric BSDF: Schlick Fresnel, Snell
+   refraction, TIR detection, Russian roulette reflect/refract,
+   Beer's law absorption, medium stack push/pop
+6. **Direct lighting (NEE)** — fires a shadow ray toward the point
+   light; any-hit BVH traversal accumulates Beer's law transmittance
+   through glass, immediately blocks on opaque hits; writes
+   N·L × falloff × light_color × base_color to `accum_buf`
+   (additive accumulation with indirect paths arrives in B07)
+7. **Blit** — fullscreen blit reads `rgba16float` `accum_buf` to canvas
+   (Khronos PBR Neutral tonemapping in a later step)
 
-Current scene: one clear glass sphere (`MaterialType::Glass`,
-`IOR=1.5`, `base_color=[1,1,1]`, zero absorption). Air is material
-index 0; glass is material index 1. Single-bounce — refracted and
-reflected rays resolve to the background colour, so the sphere is
-transparent against the dark background. Magenta indicates a medium
-stack underflow (geometry error).
+Current scene: clear glass sphere (`IOR=1.5`) at origin, radius 0.5;
+warm tan diffuse sphere at y=−1.5, radius 1.0. Point light at (2, 4, 2),
+warm white, intensity 20. Warm gray background (0.45, 0.42, 0.38).
+Material indices: 0=air, 1=glass, 2=diffuse. Magenta = medium stack
+underflow (geometry error).
 
 ## Known Issues
 
@@ -63,7 +63,8 @@ not affect rendering correctness when working.
       sphere buffer instead of hardcoded index
 - [x] Step 6d — Glass BSDF: Schlick Fresnel, Snell refraction, TIR,
       medium stack push/pop, Beer's law; sphere is now clear glass
-- [ ] Step 7 — Next event estimation
+- [x] Step 7 — Next event estimation: point light, shadow rays, NEE
+      direct kernel; second diffuse sphere; warm background; accum_buf
 - [ ] Step 8 — Sky mask
 - [ ] Step 9 — Temporal accumulation
 - [ ] Step 10 — Denoiser

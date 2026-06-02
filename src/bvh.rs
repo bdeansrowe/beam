@@ -120,36 +120,60 @@ pub struct HitRecord {
 // 32 bytes. Clean multiple of 16. WGSL struct must mirror exactly.
 // Miss sentinel: t == f32::MAX (bitcast<f32>(0x7f7fffffu)).
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct LightUniform {
+    pub position:  [f32; 4],  // .xyz=pos, .w=unused         — offset  0
+    pub color:     [f32; 4],  // .rgb=color, .w=unused        — offset 16
+    pub intensity: f32,       //                               — offset 32
+    pub _pad:      [f32; 7],  // WGSL vec3<f32> has align 16 — offset 36..64
+}
+// 64 bytes. WGSL vec3<f32> aligns to 16, placing _pad at offset 48;
+// Rust [f32;7] at offset 36 covers the implicit gap + the vec3 + tail pad.
+
 pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
     let nodes = vec![
-        // Node 0: BLAS leaf — unit sphere at origin, sphere_index=0
+        // Node 0: BLAS leaf — glass sphere at origin, radius 0.5, sphere_index=0
         BvhNode {
             aabb_min_left_start:  [-0.5, -0.5, -0.5, f32::from_bits(0)],
             aabb_max_right_count: [ 0.5,  0.5,  0.5, f32::from_bits(0)],
             node_type: NODE_LEAF_SPHERE,
             _reserved: [0; 3],
         },
-    ];
-
-    let instances = vec![
-        TlasInstance {
-            transform: [
-                1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0,
-            ],
-            blas_offset: 0,
-            flags:       0,
-            _reserved:   [0; 2],
+        // Node 1: BLAS leaf — diffuse sphere at (0,-1.5,0), radius 1.0, sphere_index=1
+        BvhNode {
+            aabb_min_left_start:  [-1.0, -2.5, -1.0, f32::from_bits(1)],
+            aabb_max_right_count: [ 1.0, -0.5,  1.0, f32::from_bits(0)],
+            node_type: NODE_LEAF_SPHERE,
+            _reserved: [0; 3],
         },
     ];
 
+    let identity = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0_f32,
+    ];
+
+    let instances = vec![
+        TlasInstance { transform: identity, blas_offset: 0, flags: 0, _reserved: [0; 2] },
+        TlasInstance { transform: identity, blas_offset: 1, flags: 0, _reserved: [0; 2] },
+    ];
+
     let spheres = vec![
+        // Sphere 0: glass sphere
         Sphere {
             center_radius:     [0.0, 0.0, 0.0, 0.5],
             front_material_id: 1,
             back_material_id:  1,
+            _pad:              [0; 2],
+        },
+        // Sphere 1: diffuse sphere (externally tangent to glass sphere at y=-0.5)
+        Sphere {
+            center_radius:     [0.0, -1.5, 0.0, 1.0],
+            front_material_id: 2,
+            back_material_id:  2,
             _pad:              [0; 2],
         },
     ];

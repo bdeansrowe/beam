@@ -6,7 +6,7 @@
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(hdr_out);
+    let dims = textureDimensions(accum_buf);
     let px = gid.x;
     let py = gid.y;
     if px >= dims.x || py >= dims.y { return; }
@@ -29,5 +29,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ndotl     = max(0.0, dot(normal, light_dir));
     let color     = mat.base_color.rgb * ndotl;
 
-    textureStore(hdr_out, vec2<i32>(i32(px), i32(py)), vec4<f32>(color, 1.0));
+    textureStore(accum_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(color, 1.0));
 }

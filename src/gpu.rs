@@ -4,7 +4,7 @@ use std::rc::Rc;
 use wgpu::*;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::bvh::{build_trivial_scene, HitRecord, Material, MaterialType, Ray, Vertex, TriangleRecord};
+use crate::bvh::{build_trivial_scene, HitRecord, LightUniform, Material, MaterialType, Ray, Vertex, TriangleRecord};
 
 // ── Camera uniform — mirrors WGSL `struct Camera` in ray_gen.wgsl ─────────────
 #[repr(C)]
@@ -63,6 +63,9 @@ pub struct GpuState {
     // Material buffer (Step 6)
     #[allow(dead_code)]
     material_buf: Buffer,
+    // Light buffer (Step 7 / B06-4)
+    #[allow(dead_code)]
+    light_buf: Buffer,
 
     // Hit record buffer (Step 6b)
     #[allow(dead_code)]
@@ -72,13 +75,15 @@ pub struct GpuState {
     shade_diffuse_pipeline:  ComputePipeline,
     shade_metallic_pipeline: ComputePipeline,
     shade_glass_pipeline:    ComputePipeline,
-    shade_scene_bg0:          BindGroup,
-    shade_bg1_readonly:       BindGroup,  // diffuse + metallic: rays read-only
-    shade_bg1_readwrite:      BindGroup,  // glass: rays read-write
+    shade_direct_pipeline:   ComputePipeline,
+    shade_scene_bg0:         BindGroup,
+    shade_direct_bg0:        BindGroup,
+    shade_bg1_readonly:      BindGroup,  // diffuse + metallic + direct: rays read-only
+    shade_bg1_readwrite:     BindGroup,  // glass: rays read-write
 
-    // Sphere intersection + HDR output (Step 4/5)
+    // Accumulation texture (Step B06-1)
     #[allow(dead_code)]
-    hdr_texture:        Texture,
+    accum_texture:      Texture,
     intersect_pipeline: ComputePipeline,
     intersect_bg1:      BindGroup,
     scene_bg0:          BindGroup,
@@ -124,9 +129,14 @@ impl GpuState {
 
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
-                label:                 Some("Main Device"),
-                required_features:     Features::empty(),
-                required_limits:       Limits::default(),
+                label:             Some("Main Device"),
+                required_features: Features::empty(),
+                // BG0 has 9 storage buffers in the intersect stage (default limit is 8).
+                // The adapter reports supporting 10, so this is safe on target hardware.
+                required_limits: Limits {
+                    max_storage_buffers_per_shader_stage: 10,
+                    ..Limits::default()
+                },
                 experimental_features: ExperimentalFeatures::default(),
                 memory_hints:          Default::default(),
                 trace:                 Trace::Off,
@@ -156,6 +166,13 @@ impl GpuState {
         let (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf, material_buf) =
             Self::create_bvh_buffers(&device);
 
+        let light_buf = Self::upload_slice(&device, "Light Buffer", &[LightUniform {
+            position:  [2.0, 4.0, 2.0, 0.0],
+            color:     [1.0, 0.95, 0.88, 0.0],
+            intensity: 20.0,
+            _pad:      [0.0; 7],
+        }]);
+
         let hit_buf = device.create_buffer(&BufferDescriptor {
             label:              Some("Hit Buffer"),
             size:               (size.width * size.height) as u64
@@ -164,33 +181,38 @@ impl GpuState {
             mapped_at_creation: false,
         });
 
-        let (hdr_texture, hdr_view, intersect_pipeline, intersect_bg1, scene_bg0) =
+        let (accum_texture, accum_view, intersect_pipeline, intersect_bg1, scene_bg0) =
             Self::create_intersect(
                 &device, &ray_buf,
                 &hit_buf,
                 &bvh_node_buf, &tlas_instance_buf, &sphere_buf,
                 &vertex_buf, &geometry_buf, &material_buf,
+                &light_buf,
                 size.width, size.height,
             ).await;
 
         let (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline,
-             shade_scene_bg0, shade_bg1_readonly, shade_bg1_readwrite) =
+             shade_direct_pipeline,
+             shade_scene_bg0, shade_direct_bg0, shade_bg1_readonly, shade_bg1_readwrite) =
             Self::create_shade_pipelines(
                 &device,
                 &ray_buf,
                 &hit_buf,
+                &bvh_node_buf,
+                &tlas_instance_buf,
                 &sphere_buf,
                 &vertex_buf,
                 &geometry_buf,
                 &material_buf,
-                &hdr_view,
+                &light_buf,
+                &accum_view,
             ).await;
 
         let (blit_pipeline, blit_bg0) =
-            Self::create_blit(&device, &config, &hdr_view);
+            Self::create_blit(&device, &config, &accum_view);
 
         log::info!(
-            "Step 6d ready: {}×{} rays, glass BSDF online (Fresnel/Snell/Beer/medium-stack)",
+            "B06 ready: {}×{} — accum_buf, warm BG, two spheres, point light, NEE shadow kernel",
             size.width, size.height,
         );
 
@@ -198,11 +220,12 @@ impl GpuState {
             surface, device, queue, config, size,
             camera_buf, ray_buf, ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1,
             bvh_node_buf, tlas_instance_buf, sphere_buf,
-            vertex_buf, geometry_buf, material_buf,
+            vertex_buf, geometry_buf, material_buf, light_buf,
             hit_buf,
             shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline,
-            shade_scene_bg0, shade_bg1_readonly, shade_bg1_readwrite,
-            hdr_texture, intersect_pipeline, intersect_bg1, scene_bg0,
+            shade_direct_pipeline,
+            shade_scene_bg0, shade_direct_bg0, shade_bg1_readonly, shade_bg1_readwrite,
+            accum_texture, intersect_pipeline, intersect_bg1, scene_bg0,
             blit_pipeline, blit_bg0,
             frame: 0,
         })
@@ -246,6 +269,16 @@ impl GpuState {
                 absorption:    [0.0, 0.0, 0.0, 0.0],
                 material_type: MaterialType::Glass,
                 ior:           1.5,
+                roughness:     0.0,
+                _pad:          0.0,
+            },
+            // Index 2: warm tan diffuse sphere.
+            Material {
+                base_color:    [0.72, 0.60, 0.45, 1.0],
+                emission:      [0.0, 0.0, 0.0, 0.0],
+                absorption:    [0.0, 0.0, 0.0, 0.0],
+                material_type: MaterialType::Diffuse,
+                ior:           1.0,
                 roughness:     0.0,
                 _pad:          0.0,
             },
@@ -329,11 +362,12 @@ impl GpuState {
         vertex_buf:        &Buffer,
         geometry_buf:      &Buffer,
         material_buf:      &Buffer,
+        light_buf:         &Buffer,
         width:  u32,
         height: u32,
     ) -> (Texture, TextureView, ComputePipeline, BindGroup, BindGroup) {
-        let hdr_texture = device.create_texture(&TextureDescriptor {
-            label:            Some("HDR Texture"),
+        let accum_texture = device.create_texture(&TextureDescriptor {
+            label:            Some("Accum Texture"),
             size:             Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count:  1,
             sample_count:     1,
@@ -342,7 +376,7 @@ impl GpuState {
             usage:            TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
             view_formats:     &[],
         });
-        let hdr_view = hdr_texture.create_view(&TextureViewDescriptor::default());
+        let accum_view = accum_texture.create_view(&TextureViewDescriptor::default());
 
         // BG0 — scene-global: BVH nodes, TLAS instances, spheres, vertices, geometry
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -396,6 +430,14 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 6, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let scene_bg0 = device.create_bind_group(&BindGroupDescriptor {
@@ -407,6 +449,7 @@ impl GpuState {
                 BindGroupEntry { binding: 3, resource: vertex_buf.as_entire_binding() },
                 BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
                 BindGroupEntry { binding: 5, resource: material_buf.as_entire_binding() },
+                BindGroupEntry { binding: 6, resource: light_buf.as_entire_binding() },
             ],
         });
 
@@ -445,7 +488,7 @@ impl GpuState {
             label: Some("Intersect BG1"), layout: &bg1_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&hdr_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&accum_view) },
                 BindGroupEntry { binding: 2, resource: hit_buf.as_entire_binding() },
             ],
         });
@@ -482,11 +525,11 @@ impl GpuState {
             log::error!("Intersect pipeline validation error: {:?}", err);
         }
 
-        (hdr_texture, hdr_view, pipeline, intersect_bg1, scene_bg0)
+        (accum_texture, accum_view, pipeline, intersect_bg1, scene_bg0)
     }
 
     fn create_blit(
-        device: &Device, config: &SurfaceConfiguration, hdr_view: &TextureView,
+        device: &Device, config: &SurfaceConfiguration, accum_view: &TextureView,
     ) -> (RenderPipeline, BindGroup) {
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Blit BG0"),
@@ -503,7 +546,7 @@ impl GpuState {
         let blit_bg0 = device.create_bind_group(&BindGroupDescriptor {
             label: Some("Blit BG0"), layout: &bg0_layout,
             entries: &[BindGroupEntry {
-                binding: 0, resource: BindingResource::TextureView(hdr_view),
+                binding: 0, resource: BindingResource::TextureView(accum_view),
             }],
         });
 
@@ -539,15 +582,19 @@ impl GpuState {
     }
 
     async fn create_shade_pipelines(
-        device:       &Device,
-        ray_buf:      &Buffer,
-        hit_buf:      &Buffer,
-        sphere_buf:   &Buffer,
-        vertex_buf:   &Buffer,
-        geometry_buf: &Buffer,
-        material_buf: &Buffer,
-        hdr_view:     &TextureView,
-    ) -> (ComputePipeline, ComputePipeline, ComputePipeline, BindGroup, BindGroup, BindGroup) {
+        device:            &Device,
+        ray_buf:           &Buffer,
+        hit_buf:           &Buffer,
+        bvh_node_buf:      &Buffer,
+        tlas_instance_buf: &Buffer,
+        sphere_buf:        &Buffer,
+        vertex_buf:        &Buffer,
+        geometry_buf:      &Buffer,
+        material_buf:      &Buffer,
+        light_buf:         &Buffer,
+        accum_view:        &TextureView,
+    ) -> (ComputePipeline, ComputePipeline, ComputePipeline, ComputePipeline,
+          BindGroup, BindGroup, BindGroup, BindGroup) {
         // BG0 — scene resources for shading (bindings 2-5; 0/1 are intersect-only)
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Shade BG0"),
@@ -584,6 +631,14 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 6, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let shade_scene_bg0 = device.create_bind_group(&BindGroupDescriptor {
@@ -593,6 +648,7 @@ impl GpuState {
                 BindGroupEntry { binding: 3, resource: vertex_buf.as_entire_binding() },
                 BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
                 BindGroupEntry { binding: 5, resource: material_buf.as_entire_binding() },
+                BindGroupEntry { binding: 6, resource: light_buf.as_entire_binding() },
             ],
         });
 
@@ -642,7 +698,7 @@ impl GpuState {
             label: Some("Shade BG1 Readonly"), layout: &bg1_readonly_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: hit_buf.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(hdr_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(accum_view) },
                 BindGroupEntry { binding: 2, resource: ray_buf.as_entire_binding() },
             ],
         });
@@ -650,7 +706,7 @@ impl GpuState {
             label: Some("Shade BG1 Readwrite"), layout: &bg1_readwrite_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: hit_buf.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(hdr_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(accum_view) },
                 BindGroupEntry { binding: 2, resource: ray_buf.as_entire_binding() },
             ],
         });
@@ -743,8 +799,67 @@ impl GpuState {
             log::error!("Shade Glass pipeline validation error: {:?}", err);
         }
 
+        // ── shade_direct: full BG0 (bindings 0-6) for shadow ray BVH traversal ─
+        let sd_storage_ro = |binding: u32| BindGroupLayoutEntry {
+            binding, visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false, min_binding_size: None,
+            },
+            count: None,
+        };
+        let shade_direct_bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Shade Direct BG0"),
+            entries: &[
+                sd_storage_ro(0), sd_storage_ro(1), sd_storage_ro(2),
+                sd_storage_ro(3), sd_storage_ro(4), sd_storage_ro(5),
+                sd_storage_ro(6),
+            ],
+        });
+        let shade_direct_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Shade Direct BG0"), layout: &shade_direct_bg0_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: bvh_node_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: tlas_instance_buf.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: sphere_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: vertex_buf.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
+                BindGroupEntry { binding: 5, resource: material_buf.as_entire_binding() },
+                BindGroupEntry { binding: 6, resource: light_buf.as_entire_binding() },
+            ],
+        });
+
+        let direct_src = format!("{}\n{}\n{}", common_common, shade_common, include_str!("shade_direct.wgsl"));
+        let direct_module = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Shade Direct"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(direct_src)),
+        });
+        let direct_info = direct_module.get_compilation_info().await;
+        for msg in &direct_info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("shade_direct: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("shade_direct: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let shade_direct_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Shade Direct Layout"),
+            bind_group_layouts: &[&shade_direct_bg0_layout, &bg1_readonly_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let shade_direct_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Shade Direct"), layout: Some(&shade_direct_layout), module: &direct_module,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Shade Direct pipeline validation error: {:?}", err);
+        }
+
         (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline,
-         shade_scene_bg0, shade_bg1_readonly, shade_bg1_readwrite)
+         shade_direct_pipeline,
+         shade_scene_bg0, shade_direct_bg0, shade_bg1_readonly, shade_bg1_readwrite)
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -845,7 +960,22 @@ impl GpuState {
             );
         }
 
-        // 6. Blit HDR texture → canvas
+        // 6. Direct lighting (NEE) — shadow rays, overwrites per-pixel color
+        {
+            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("Shade Direct"), timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.shade_direct_pipeline);
+            cpass.set_bind_group(0, &self.shade_direct_bg0, &[]);
+            cpass.set_bind_group(1, &self.shade_bg1_readonly, &[]);
+            cpass.dispatch_workgroups(
+                (self.size.width + 7) / 8,
+                (self.size.height + 7) / 8,
+                1,
+            );
+        }
+
+        // 7. Blit accum_buf → canvas
         {
             let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label:                    Some("Blit"),

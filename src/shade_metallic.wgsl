@@ -6,7 +6,7 @@
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(hdr_out);
+    let dims = textureDimensions(accum_buf);
     let px = gid.x;
     let py = gid.y;
     if px >= dims.x || py >= dims.y { return; }
@@ -29,5 +29,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Stand-in: uniform environment color tinted by base_color.
     let color = mat.base_color.rgb * BACKGROUND.rgb;
 
-    textureStore(hdr_out, vec2<i32>(i32(px), i32(py)), vec4<f32>(color, 1.0));
+    textureStore(accum_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(color, 1.0));
 }
