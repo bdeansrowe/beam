@@ -1,8 +1,8 @@
 // shade_direct.wgsl — direct lighting (NEE) kernel.
-// Fires a shadow ray toward the point light and writes direct illumination to accum_buf.
+// Fires a shadow ray toward the point light and writes direct illumination to scratch_buf.
 // Composed with shade_common.wgsl at pipeline creation:
 //   common_common.wgsl (BvhNode, TlasInstance, Sphere, Material, LightUniform, helpers) +
-//   shade_common.wgsl  (BG0 bindings 2-6, BG1 hit_records + accum_buf, utilities) +
+//   shade_common.wgsl  (BG0 bindings 2-6, BG1 hit_records + scratch_buf, utilities) +
 //   shade_direct.wgsl  (BG0 bindings 0-1, BG1 rays, entry point)
 
 // BG0 bindings 0 and 1 — needed for shadow ray BVH traversal.
@@ -14,7 +14,7 @@
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(accum_buf);
+    let dims = textureDimensions(scratch_buf);
     let px = gid.x;
     let py = gid.y;
     if px >= dims.x || py >= dims.y { return; }
@@ -120,5 +120,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         !shadow_blocked,
     );
 
-    textureStore(accum_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(direct, 1.0));
+    textureStore(scratch_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(direct, 1.0));
 }

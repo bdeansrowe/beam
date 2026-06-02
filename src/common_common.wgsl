@@ -124,6 +124,11 @@ struct LightUniform {
     _pad:      vec3<f32>,
 }  // 48 bytes
 
+struct FrameUniform {
+    frame: u32,
+    _pad:  array<u32, 3>,
+}  // 16 bytes
+
 const F32_MAX:      f32       = bitcast<f32>(0x7f7fffffu);
 const PI:           f32       = 3.14159265358979323846;
 const MAT_DIFFUSE:  u32       = 0u;

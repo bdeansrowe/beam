@@ -14,11 +14,12 @@ struct CameraUniform {
     lower_left: [f32; 4],
     horizontal: [f32; 4],
     vertical:   [f32; 4],
-    dims:       [u32; 4],  // [0]=width [1]=height [2]=frame [3]=pad
+    dims:      [u32; 2],  // [0]=width [1]=height
+    _dims_pad: [u32; 2],
 }
 
 impl CameraUniform {
-    fn new(width: u32, height: u32, frame: u32) -> Self {
+    fn new(width: u32, height: u32) -> Self {
         let half_h = (60.0_f32.to_radians() * 0.5).tan();
         let half_w = (width as f32 / height as f32) * half_h;
         CameraUniform {
@@ -26,9 +27,18 @@ impl CameraUniform {
             lower_left: [-half_w, -half_h, 2.0, 0.0],
             horizontal: [2.0 * half_w, 0.0, 0.0, 0.0],
             vertical:   [0.0, 2.0 * half_h, 0.0, 0.0],
-            dims:       [width, height, frame, 0],
+            dims:      [width, height],
+            _dims_pad: [0, 0],
         }
     }
+}
+
+// ── Frame uniform — BG0 binding 7 across all pipeline BG0s ───────────────────
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct FrameUniform {
+    frame: u32,
+    _pad:  [u32; 3],
 }
 
 // ── GPU state ──────────────────────────────────────────────────────────────────
@@ -41,6 +51,7 @@ pub struct GpuState {
 
     // Ray generation (Step 3)
     camera_buf:       Buffer,
+    frame_buf:        Buffer,
     #[allow(dead_code)]
     ray_buf:          Buffer,
     ray_gen_pipeline: ComputePipeline,
@@ -81,16 +92,27 @@ pub struct GpuState {
     shade_bg1_readonly:      BindGroup,  // diffuse + metallic + direct: rays read-only
     shade_bg1_readwrite:     BindGroup,  // glass: rays read-write
 
-    // Accumulation texture (Step B06-1)
+    // Textures (Step B06-1 / B07a)
     #[allow(dead_code)]
-    accum_texture:      Texture,
+    scratch_texture:    Texture,
+    #[allow(dead_code)]
+    accum_texture_a:    Texture,
+    #[allow(dead_code)]
+    accum_texture_b:    Texture,
     intersect_pipeline: ComputePipeline,
     intersect_bg1:      BindGroup,
     scene_bg0:          BindGroup,
 
+    // Accumulate: ping-pong blend (B07a)
+    accumulate_pipeline: ComputePipeline,
+    accum_bg0:           BindGroup,
+    accum_bg1_a:         BindGroup,  // even frames: write A, read history B
+    accum_bg1_b:         BindGroup,  // odd frames:  write B, read history A
+
     // Blit to canvas (Step 4)
     blit_pipeline: RenderPipeline,
-    blit_bg0:      BindGroup,
+    blit_bg0_a:    BindGroup,  // reads A
+    blit_bg0_b:    BindGroup,  // reads B
 
     frame: u32,
 }
@@ -160,8 +182,15 @@ impl GpuState {
         };
         surface.configure(&device, &config);
 
+        let frame_buf = device.create_buffer(&BufferDescriptor {
+            label:              Some("Frame Uniform"),
+            size:               std::mem::size_of::<FrameUniform>() as u64,
+            usage:              BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let (ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf) =
-            Self::create_ray_gen(&device, size.width, size.height);
+            Self::create_ray_gen(&device, size.width, size.height, &frame_buf);
 
         let (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf, material_buf) =
             Self::create_bvh_buffers(&device);
@@ -181,13 +210,17 @@ impl GpuState {
             mapped_at_creation: false,
         });
 
-        let (accum_texture, accum_view, intersect_pipeline, intersect_bg1, scene_bg0) =
+        let (scratch_texture, scratch_view,
+             accum_texture_a, accum_view_a,
+             accum_texture_b, accum_view_b,
+             intersect_pipeline, intersect_bg1, scene_bg0) =
             Self::create_intersect(
                 &device, &ray_buf,
                 &hit_buf,
                 &bvh_node_buf, &tlas_instance_buf, &sphere_buf,
                 &vertex_buf, &geometry_buf, &material_buf,
                 &light_buf,
+                &frame_buf,
                 size.width, size.height,
             ).await;
 
@@ -205,11 +238,15 @@ impl GpuState {
                 &geometry_buf,
                 &material_buf,
                 &light_buf,
-                &accum_view,
+                &frame_buf,
+                &scratch_view,
             ).await;
 
-        let (blit_pipeline, blit_bg0) =
-            Self::create_blit(&device, &config, &accum_view);
+        let (blit_pipeline, blit_bg0_a, blit_bg0_b) =
+            Self::create_blit(&device, &config, &accum_view_a, &accum_view_b);
+
+        let (accumulate_pipeline, accum_bg0, accum_bg1_a, accum_bg1_b) =
+            Self::create_accumulate(&device, &frame_buf, &scratch_view, &accum_view_a, &accum_view_b).await;
 
         log::info!(
             "B06 ready: {}×{} — accum_buf, warm BG, two spheres, point light, NEE shadow kernel",
@@ -218,15 +255,17 @@ impl GpuState {
 
         Ok(Self {
             surface, device, queue, config, size,
-            camera_buf, ray_buf, ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1,
+            camera_buf, frame_buf, ray_buf, ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1,
             bvh_node_buf, tlas_instance_buf, sphere_buf,
             vertex_buf, geometry_buf, material_buf, light_buf,
             hit_buf,
             shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline,
             shade_direct_pipeline,
             shade_scene_bg0, shade_direct_bg0, shade_bg1_readonly, shade_bg1_readwrite,
-            accum_texture, intersect_pipeline, intersect_bg1, scene_bg0,
-            blit_pipeline, blit_bg0,
+            scratch_texture, accum_texture_a, accum_texture_b,
+            intersect_pipeline, intersect_bg1, scene_bg0,
+            accumulate_pipeline, accum_bg0, accum_bg1_a, accum_bg1_b,
+            blit_pipeline, blit_bg0_a, blit_bg0_b,
             frame: 0,
         })
     }
@@ -287,18 +326,28 @@ impl GpuState {
     }
 
     fn create_ray_gen(
-        device: &Device, width: u32, height: u32,
+        device: &Device, width: u32, height: u32, frame_buf: &Buffer,
     ) -> (ComputePipeline, BindGroup, BindGroup, Buffer, Buffer) {
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Ray Gen BG0"),
-            entries: &[BindGroupLayoutEntry {
-                binding: 0, visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false, min_binding_size: None,
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
         let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Ray Gen BG1"),
@@ -327,7 +376,10 @@ impl GpuState {
 
         let ray_gen_bg0 = device.create_bind_group(&BindGroupDescriptor {
             label: Some("Ray Gen BG0"), layout: &bg0_layout,
-            entries: &[BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() }],
+            entries: &[
+                BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: frame_buf.as_entire_binding() },
+            ],
         });
         let ray_gen_bg1 = device.create_bind_group(&BindGroupDescriptor {
             label: Some("Ray Gen BG1"), layout: &bg1_layout,
@@ -363,11 +415,12 @@ impl GpuState {
         geometry_buf:      &Buffer,
         material_buf:      &Buffer,
         light_buf:         &Buffer,
+        frame_buf:         &Buffer,
         width:  u32,
         height: u32,
-    ) -> (Texture, TextureView, ComputePipeline, BindGroup, BindGroup) {
-        let accum_texture = device.create_texture(&TextureDescriptor {
-            label:            Some("Accum Texture"),
+    ) -> (Texture, TextureView, Texture, TextureView, Texture, TextureView, ComputePipeline, BindGroup, BindGroup) {
+        let tex_desc = TextureDescriptor {
+            label:            None,
             size:             Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count:  1,
             sample_count:     1,
@@ -375,8 +428,13 @@ impl GpuState {
             format:           TextureFormat::Rgba16Float,
             usage:            TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
             view_formats:     &[],
-        });
-        let accum_view = accum_texture.create_view(&TextureViewDescriptor::default());
+        };
+        let scratch_texture = device.create_texture(&TextureDescriptor { label: Some("Scratch Texture"),  ..tex_desc });
+        let scratch_view    = scratch_texture.create_view(&TextureViewDescriptor::default());
+        let accum_texture_a = device.create_texture(&TextureDescriptor { label: Some("Accum Texture A"), ..tex_desc });
+        let accum_view_a    = accum_texture_a.create_view(&TextureViewDescriptor::default());
+        let accum_texture_b = device.create_texture(&TextureDescriptor { label: Some("Accum Texture B"), ..tex_desc });
+        let accum_view_b    = accum_texture_b.create_view(&TextureViewDescriptor::default());
 
         // BG0 — scene-global: BVH nodes, TLAS instances, spheres, vertices, geometry
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -438,6 +496,14 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 7, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let scene_bg0 = device.create_bind_group(&BindGroupDescriptor {
@@ -450,6 +516,7 @@ impl GpuState {
                 BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
                 BindGroupEntry { binding: 5, resource: material_buf.as_entire_binding() },
                 BindGroupEntry { binding: 6, resource: light_buf.as_entire_binding() },
+                BindGroupEntry { binding: 7, resource: frame_buf.as_entire_binding() },
             ],
         });
 
@@ -488,7 +555,7 @@ impl GpuState {
             label: Some("Intersect BG1"), layout: &bg1_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&accum_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&scratch_view) },
                 BindGroupEntry { binding: 2, resource: hit_buf.as_entire_binding() },
             ],
         });
@@ -525,12 +592,114 @@ impl GpuState {
             log::error!("Intersect pipeline validation error: {:?}", err);
         }
 
-        (accum_texture, accum_view, pipeline, intersect_bg1, scene_bg0)
+        (scratch_texture, scratch_view, accum_texture_a, accum_view_a, accum_texture_b, accum_view_b, pipeline, intersect_bg1, scene_bg0)
+    }
+
+    async fn create_accumulate(
+        device:       &Device,
+        frame_buf:    &Buffer,
+        scratch_view: &TextureView,
+        a_view:       &TextureView,
+        b_view:       &TextureView,
+    ) -> (ComputePipeline, BindGroup, BindGroup, BindGroup) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Accumulate BG0"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        // scratch and prev are read via Texture bindings (textureLoad) to avoid the
+        // "read-write-and-read-only-storage-textures" WebGPU feature requirement.
+        let tex_entry = |b: u32| BindGroupLayoutEntry {
+            binding: b, visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Texture {
+                sample_type:    TextureSampleType::Float { filterable: false },
+                view_dimension: TextureViewDimension::D2,
+                multisampled:   false,
+            },
+            count: None,
+        };
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Accumulate BG1"),
+            entries: &[
+                tex_entry(0),  // scratch_tex — new sample
+                tex_entry(1),  // prev_accum  — history
+                BindGroupLayoutEntry {
+                    binding: 2, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::StorageTexture {
+                        access:         StorageTextureAccess::WriteOnly,
+                        format:         TextureFormat::Rgba16Float,
+                        view_dimension: TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let accum_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Accumulate BG0"), layout: &bg0_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() }],
+        });
+        // accum_bg1_a: writes to A (even frames); reads history from B
+        let accum_bg1_a = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Accumulate BG1-A"), layout: &bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(scratch_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(b_view) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(a_view) },
+            ],
+        });
+        // accum_bg1_b: writes to B (odd frames); reads history from A
+        let accum_bg1_b = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Accumulate BG1-B"), layout: &bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: BindingResource::TextureView(scratch_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(a_view) },
+                BindGroupEntry { binding: 2, resource: BindingResource::TextureView(b_view) },
+            ],
+        });
+
+        let common_common = include_str!("common_common.wgsl");
+        let accum_src     = format!("{}\n{}", common_common, include_str!("accumulate.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Accumulate"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(accum_src)),
+        });
+        let accum_info = shader.get_compilation_info().await;
+        for msg in &accum_info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("accumulate.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("accumulate.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Accumulate Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Accumulate"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Accumulate pipeline validation error: {:?}", err);
+        }
+
+        (pipeline, accum_bg0, accum_bg1_a, accum_bg1_b)
     }
 
     fn create_blit(
-        device: &Device, config: &SurfaceConfiguration, accum_view: &TextureView,
-    ) -> (RenderPipeline, BindGroup) {
+        device: &Device, config: &SurfaceConfiguration, a_view: &TextureView, b_view: &TextureView,
+    ) -> (RenderPipeline, BindGroup, BindGroup) {
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Blit BG0"),
             entries: &[BindGroupLayoutEntry {
@@ -543,11 +712,13 @@ impl GpuState {
                 count: None,
             }],
         });
-        let blit_bg0 = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("Blit BG0"), layout: &bg0_layout,
-            entries: &[BindGroupEntry {
-                binding: 0, resource: BindingResource::TextureView(accum_view),
-            }],
+        let blit_bg0_a = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Blit BG0-A"), layout: &bg0_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(a_view) }],
+        });
+        let blit_bg0_b = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Blit BG0-B"), layout: &bg0_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: BindingResource::TextureView(b_view) }],
         });
 
         let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
@@ -578,7 +749,7 @@ impl GpuState {
             cache:         None,
         });
 
-        (pipeline, blit_bg0)
+        (pipeline, blit_bg0_a, blit_bg0_b)
     }
 
     async fn create_shade_pipelines(
@@ -592,7 +763,8 @@ impl GpuState {
         geometry_buf:      &Buffer,
         material_buf:      &Buffer,
         light_buf:         &Buffer,
-        accum_view:        &TextureView,
+        frame_buf:         &Buffer,
+        scratch_view:      &TextureView,
     ) -> (ComputePipeline, ComputePipeline, ComputePipeline, ComputePipeline,
           BindGroup, BindGroup, BindGroup, BindGroup) {
         // BG0 — scene resources for shading (bindings 2-5; 0/1 are intersect-only)
@@ -639,6 +811,14 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 7, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let shade_scene_bg0 = device.create_bind_group(&BindGroupDescriptor {
@@ -649,6 +829,7 @@ impl GpuState {
                 BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
                 BindGroupEntry { binding: 5, resource: material_buf.as_entire_binding() },
                 BindGroupEntry { binding: 6, resource: light_buf.as_entire_binding() },
+                BindGroupEntry { binding: 7, resource: frame_buf.as_entire_binding() },
             ],
         });
 
@@ -698,7 +879,7 @@ impl GpuState {
             label: Some("Shade BG1 Readonly"), layout: &bg1_readonly_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: hit_buf.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(accum_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(scratch_view) },
                 BindGroupEntry { binding: 2, resource: ray_buf.as_entire_binding() },
             ],
         });
@@ -706,7 +887,7 @@ impl GpuState {
             label: Some("Shade BG1 Readwrite"), layout: &bg1_readwrite_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: hit_buf.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(accum_view) },
+                BindGroupEntry { binding: 1, resource: BindingResource::TextureView(scratch_view) },
                 BindGroupEntry { binding: 2, resource: ray_buf.as_entire_binding() },
             ],
         });
@@ -814,6 +995,14 @@ impl GpuState {
                 sd_storage_ro(0), sd_storage_ro(1), sd_storage_ro(2),
                 sd_storage_ro(3), sd_storage_ro(4), sd_storage_ro(5),
                 sd_storage_ro(6),
+                BindGroupLayoutEntry {
+                    binding: 7, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let shade_direct_bg0 = device.create_bind_group(&BindGroupDescriptor {
@@ -826,6 +1015,7 @@ impl GpuState {
                 BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
                 BindGroupEntry { binding: 5, resource: material_buf.as_entire_binding() },
                 BindGroupEntry { binding: 6, resource: light_buf.as_entire_binding() },
+                BindGroupEntry { binding: 7, resource: frame_buf.as_entire_binding() },
             ],
         });
 
@@ -876,8 +1066,12 @@ impl GpuState {
     }
 
     pub fn render(&mut self) -> Result<(), SurfaceError> {
-        let cam = CameraUniform::new(self.size.width, self.size.height, self.frame);
+        let cam = CameraUniform::new(self.size.width, self.size.height);
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
+        self.queue.write_buffer(
+            &self.frame_buf, 0,
+            bytemuck::bytes_of(&FrameUniform { frame: self.frame, _pad: [0; 3] }),
+        );
 
         let output  = self.surface.get_current_texture()?;
         let view    = output.texture.create_view(&TextureViewDescriptor::default());
@@ -975,7 +1169,27 @@ impl GpuState {
             );
         }
 
-        // 7. Blit accum_buf → canvas
+        // 7. Accumulate: blend scratch into ping-pong accum
+        let (accum_bg1, blit_bg0) = if self.frame % 2 == 0 {
+            (&self.accum_bg1_a, &self.blit_bg0_a)
+        } else {
+            (&self.accum_bg1_b, &self.blit_bg0_b)
+        };
+        {
+            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("Accumulate"), timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.accumulate_pipeline);
+            cpass.set_bind_group(0, &self.accum_bg0, &[]);
+            cpass.set_bind_group(1, accum_bg1, &[]);
+            cpass.dispatch_workgroups(
+                (self.size.width  + 7) / 8,
+                (self.size.height + 7) / 8,
+                1,
+            );
+        }
+
+        // 8. Blit current accum → canvas
         {
             let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label:                    Some("Blit"),
@@ -991,7 +1205,7 @@ impl GpuState {
                 occlusion_query_set:      None,
             });
             rpass.set_pipeline(&self.blit_pipeline);
-            rpass.set_bind_group(0, &self.blit_bg0, &[]);
+            rpass.set_bind_group(0, blit_bg0, &[]);
             rpass.draw(0..3, 0..1);
         }
 

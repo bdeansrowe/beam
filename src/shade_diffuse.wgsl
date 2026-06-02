@@ -6,7 +6,7 @@
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(accum_buf);
+    let dims = textureDimensions(scratch_buf);
     let px = gid.x;
     let py = gid.y;
     if px >= dims.x || py >= dims.y { return; }
@@ -21,13 +21,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         hit.face_forward == 1u);
     let mat = materials[mat_id];
     if mat.material_type != MAT_DIFFUSE { return; }
-
-    let ray    = rays[idx];
-    let normal = interpolate_normal(hit, ray);
-
-    let light_dir = normalize(vec3<f32>(1.0, 1.0, 1.0));
-    let ndotl     = max(0.0, dot(normal, light_dir));
-    let color     = mat.base_color.rgb * ndotl;
-
-    textureStore(accum_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(color, 1.0));
+    // NEE (shade_direct) owns direct lighting for diffuse surfaces.
 }

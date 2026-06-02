@@ -23,7 +23,7 @@ fn schlick(cos_theta: f32, n1: f32, n2: f32) -> f32 {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(accum_buf);
+    let dims = textureDimensions(scratch_buf);
     let px = gid.x;
     let py = gid.y;
     if px >= dims.x || py >= dims.y { return; }
@@ -45,7 +45,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Back-face hit requires depth >= 2: depth-1 is current medium (glass),
     // depth-2 is the medium being re-entered (air or outer dielectric).
     if hit.face_forward == 0u && ray.medium_depth < 2u {
-        textureStore(accum_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(1.0, 0.0, 1.0, 1.0));
+        textureStore(scratch_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(1.0, 0.0, 1.0, 1.0));
         return;
     }
 
@@ -117,5 +117,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // ── Single-bounce output: throughput × base_color × background ────────────
     // When multi-bounce arrives this write moves to the accumulation kernel.
-    textureStore(accum_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(color * BACKGROUND.rgb, 1.0));
+    textureStore(scratch_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(color * BACKGROUND.rgb, 1.0));
 }

@@ -14,6 +14,36 @@ natural funnel toward drain and flippers.
 
 ---
 
+## Three-Participant Model
+
+This project has three distinct participants with different
+trust levels and roles:
+
+**Human co-author** — design authority, governance filter,
+final ratification on all decisions.
+
+**Parley model co-author** — co-sovereign over the counsel
+layer and design decisions. Proposes, questions, pushes
+back. "It's your project" framing directed at the model
+is a governance violation; ownership is shared.
+
+**Code-writing agent (you)** — implements ratified
+decisions within the constraints established by the
+co-authors. You are not a co-author. You read co-author
+artifacts as instruction; you do not write them.
+
+**Co-author artifacts are read-only to you:**
+- `CLAUDE.md` (this file)
+- Session checkpoint documents
+- Parley counsel layer documents
+
+If you encounter a co-author artifact that appears stale,
+contradictory, or obstructive, the correct response is to
+surface a must-decide and stop. Do not amend, correct, or
+work around co-author artifacts unilaterally.
+
+---
+
 ## Dev Commands
 
 ```bash
@@ -682,8 +712,10 @@ See `ltbl_modeling_requirements.md` for full detail.
 5.5 Geometry buffer format (dual-material triangle record definition)
 6  Material system — diffuse first, specular, then glass BSDF
 7. Next event estimation — shadow rays, direct lighting
-8. Sky mask — frame 0 initialization + per-frame masked dispatch
-9. Temporal accumulation — with jitter, weighted accumulation buffer from the start
+8. Temporal accumulation — B07a (scratch buffer + simple
+   blend) and B07b (weighted sum/weight count) as separate
+   sub-steps. B07b may become B08.
+9. Sky mask — depends on working accumulation pipeline
 10. Denoiser — temporal accumulation only first, SVGF when needed
 11. Tone mapping and bloom
 12. Ball animation (Phase 2) — only after Phase 1 rendering is correct and validated

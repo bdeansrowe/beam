@@ -10,10 +10,12 @@
 @group(0) @binding(5) var<storage, read> materials      : array<Material>;
 // Step 7 — declared, not yet used
 @group(0) @binding(6) var<storage, read> lights         : array<LightUniform>;
+// B07a — declared, not yet used
+@group(0) @binding(7) var<uniform>       frame_data     : FrameUniform;
 
 // group(1) = per-pass resources
 @group(1) @binding(0) var<storage, read>       rays        : array<Ray>;
-@group(1) @binding(1) var                      accum_buf   : texture_storage_2d<rgba16float, write>;
+@group(1) @binding(1) var                      scratch_buf : texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var<storage, read_write> hit_records : array<HitRecord>;
 
 // ── BVH traversal — writes one HitRecord per ray into hit_records[idx] ────────
@@ -83,7 +85,7 @@ fn traverse_bvh(origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32, idx: u3
 // ── Main ──────────────────────────────────────────────────────────────────────
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(accum_buf);
+    let dims = textureDimensions(scratch_buf);
     let px = gid.x;
     let py = gid.y;
     if px >= dims.x || py >= dims.y { return; }
@@ -101,6 +103,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Misses: write background. Hit pixels are written by shading kernels.
     if hit_records[idx].t >= F32_MAX {
-        textureStore(accum_buf, vec2<i32>(i32(px), i32(py)), BACKGROUND);
+        textureStore(scratch_buf, vec2<i32>(i32(px), i32(py)), BACKGROUND);
     }
 }

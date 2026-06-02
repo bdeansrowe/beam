@@ -7,16 +7,17 @@ A WebGPU wavefront path-tracer built in Rust/WASM.
 ## Current state
 
 Wavefront compute pipeline rendering two analytic spheres with direct
-point lighting via Next Event Estimation:
+point lighting via Next Event Estimation, with progressive frame
+accumulation:
 
-1. **Ray generation** — pinhole camera, Halton sub-pixel jitter, rays
-   written to GPU storage buffer; medium stack pre-seeded with air
-   (`IOR=1.0`)
+1. **Ray generation** — pinhole camera, Halton sub-pixel jitter driven
+   by `FrameUniform`; rays written to GPU storage buffer; medium stack
+   pre-seeded with air (`IOR=1.0`)
 2. **BVH traversal** — quadratic sphere intersection, writes one
    `HitRecord` per ray; miss sentinel `t = f32::MAX`; background
-   written to `accum_buf`
-3. **Diffuse shading** — Lambertian stand-in (hardcoded directional);
-   superseded per-pixel by the direct lighting kernel
+   written to `scratch_buf`
+3. **Diffuse shading** — no-op; direct lighting handled exclusively by
+   the NEE kernel
 4. **Metallic shading** — perfect mirror stand-in
 5. **Glass shading** — full dielectric BSDF: Schlick Fresnel, Snell
    refraction, TIR detection, Russian roulette reflect/refract,
@@ -24,10 +25,13 @@ point lighting via Next Event Estimation:
 6. **Direct lighting (NEE)** — fires a shadow ray toward the point
    light; any-hit BVH traversal accumulates Beer's law transmittance
    through glass, immediately blocks on opaque hits; writes
-   N·L × falloff × light_color × base_color to `accum_buf`
-   (additive accumulation with indirect paths arrives in B07)
-7. **Blit** — fullscreen blit reads `rgba16float` `accum_buf` to canvas
-   (Khronos PBR Neutral tonemapping in a later step)
+   N·L × falloff × light_color × base_color to `scratch_buf`
+7. **Accumulate** — blends `scratch_buf` (new sample) into a ping-pong
+   accum pair using `mix(history, new_sample, 1/(frame+1))`; the scene
+   converges progressively across frames
+8. **Blit** — fullscreen blit reads the current frame's `rgba16float`
+   accum texture to canvas (Khronos PBR Neutral tonemapping in a later
+   step)
 
 Current scene: clear glass sphere (`IOR=1.5`) at origin, radius 0.5;
 warm tan diffuse sphere at y=−1.5, radius 1.0. Point light at (2, 4, 2),
