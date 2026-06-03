@@ -76,8 +76,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         // ── D3 — Schlick Fresnel + Russian roulette ────────────────────────────
         let F    = schlick(cos_theta, n1, n2);
-        let rand = f32(hash_u32(idx * FIBONACCI_HASH + 1u)
-                       & HASH_FLOAT_MASK) / HASH_FLOAT_DIV;
+        let rand = f32(hash_u32((idx ^ frame_data.frame) * FIBONACCI_HASH + 1u)
+               & HASH_FLOAT_MASK) / HASH_FLOAT_DIV;
         if rand < F {
             out_dir    = reflect(ray.direction.xyz, normal);
             is_reflect = true;
