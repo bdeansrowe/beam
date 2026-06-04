@@ -139,8 +139,8 @@ correctness when working.
 - **Pipeline order:** path trace → temporal accumulation → denoiser → tone mapping →
   bloom → display
 - **Tonemapping:** Khronos PBR Neutral
-- **Bounces:** 8 as starting value — increase only if caustic quality demands it, each
-  additional bounce is a full additional compute dispatch
+- **Bounces:** 8 bounces per frame, implemented in B08. Increase only if caustic
+  quality demands it — each additional bounce is a full additional GPU submit cycle
 - **Denoiser:** Start with temporal accumulation only, add SVGF when needed
 
 ---
@@ -166,6 +166,24 @@ These caused problems during scaffold development and must be respected:
   material buffer, environment map
 - **Bind group 1** — per-pass resources: ray buffers, output textures
 - Minimizes bind group switching overhead between wavefront dispatches
+
+### Storage buffer ceiling — HARD LIMIT
+
+`max_storage_buffers_per_shader_stage` is capped at 10 under Dawn/WebGPU
+(Chrome 120+). This is a hard ceiling — it cannot be raised further.
+The limit is per shader stage, summed across ALL bind groups.
+
+`shade_direct` is currently at exactly 10 (7 BG0 storage + 3 BG1 storage).
+No new storage buffer bindings can be added to any pipeline that includes
+`shade_direct` without a buffer architecture rethink first. Any B-session
+that requires a new buffer must address this constraint in the parley before
+implementation begins.
+
+### MEMORY.md
+
+`memory/MEMORY.md` is CC's operational scratchpad — written and maintained
+by CC across sessions for context continuity. It is gitignored and is NOT
+a co-author artifact. CC is permitted to read and write it freely.
 
 ---
 
@@ -712,10 +730,11 @@ See `ltbl_modeling_requirements.md` for full detail.
 5.5 Geometry buffer format (dual-material triangle record definition)
 6  Material system — diffuse first, specular, then glass BSDF
 7. Next event estimation — shadow rays, direct lighting
-8. Temporal accumulation — B07a (scratch buffer + simple
-   blend) and B07b (weighted sum/weight count) as separate
-   sub-steps. B07b may become B08.
-9. Sky mask — depends on working accumulation pipeline
+8. Multi-bounce path tracing + temporal accumulation — COMPLETE (B07a + B08).
+   scratch_buf promoted to storage buffer; Ray.throughput in-place mutation;
+   8-bounce loop with per-bounce frame_data updates; Russian roulette from
+   bounce 3; additive scratch_buf accumulation; ping-pong temporal blend.
+9. Sky mask — depends on working accumulation pipeline (B08 complete)
 10. Denoiser — temporal accumulation only first, SVGF when needed
 11. Tone mapping and bloom
 12. Ball animation (Phase 2) — only after Phase 1 rendering is correct and validated

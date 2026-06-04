@@ -35,6 +35,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     r.direction          = vec4<f32>(dir, 1e30);
     r.medium_stack[0]    = MediumEntry(0u, 1.0);  // air
     r.medium_depth       = 1u;
+    r.throughput         = array<f32, 3>(1.0, 1.0, 1.0);
     rays[idx] = r;
 }
 

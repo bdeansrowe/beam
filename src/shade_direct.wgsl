@@ -10,16 +10,15 @@
 @group(0) @binding(0) var<storage, read> bvh_nodes:     array<BvhNode>;
 @group(0) @binding(1) var<storage, read> tlas_instances: array<TlasInstance>;
 
-@group(1) @binding(2) var<storage, read> rays: array<Ray>;
+@group(1) @binding(2) var<storage, read_write> rays: array<Ray>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(scratch_buf);
     let px = gid.x;
     let py = gid.y;
-    if px >= dims.x || py >= dims.y { return; }
+    if px >= frame_data.dim_x || py >= frame_data.dim_y { return; }
 
-    let idx = py * dims.x + px;
+    let idx = py * frame_data.dim_x + px;
     let hit = hit_records[idx];
 
     // Skip background — already written by intersect kernel.
@@ -111,14 +110,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // ── Direct illumination (replacement write; additive accumulation in B07) ─
+    // ── Direct illumination — scaled by path throughput, added to frame accumulator ──
+    let tp      = ray.throughput;
     let n_dot_l = max(0.0, dot(normal, shadow_dir));
     let falloff = 1.0 / (dist * dist);
     let direct  = select(
         vec3<f32>(0.0),
         light.color.rgb * light.intensity * n_dot_l * falloff * transmittance * mat.base_color.rgb,
         !shadow_blocked,
-    );
+    ) * vec3<f32>(tp[0], tp[1], tp[2]);
 
-    textureStore(scratch_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(direct, 1.0));
+    scratch_buf[idx] += vec4<f32>(direct, 0.0);
 }

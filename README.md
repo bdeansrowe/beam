@@ -6,32 +6,33 @@ A WebGPU wavefront path-tracer built in Rust/WASM.
 
 ## Current state
 
-Wavefront compute pipeline rendering two analytic spheres with direct
-point lighting via Next Event Estimation, with progressive frame
-accumulation:
+Full multi-bounce wavefront path tracer rendering two analytic spheres
+with indirect illumination, glass refraction, and NEE direct lighting.
+8 bounces per frame; progressive accumulation across frames.
 
-1. **Ray generation** — pinhole camera, Halton sub-pixel jitter driven
-   by `FrameUniform`; rays written to GPU storage buffer; medium stack
-   pre-seeded with air (`IOR=1.0`)
-2. **BVH traversal** — quadratic sphere intersection, writes one
-   `HitRecord` per ray; miss sentinel `t = f32::MAX`; background
-   written to `scratch_buf`
-3. **Diffuse shading** — no-op; direct lighting handled exclusively by
-   the NEE kernel
-4. **Metallic shading** — perfect mirror stand-in
-5. **Glass shading** — full dielectric BSDF: Schlick Fresnel, Snell
-   refraction, TIR detection, Russian roulette reflect/refract,
-   Beer's law absorption, medium stack push/pop
-6. **Direct lighting (NEE)** — fires a shadow ray toward the point
-   light; any-hit BVH traversal accumulates Beer's law transmittance
-   through glass, immediately blocks on opaque hits; writes
-   N·L × falloff × light_color × base_color to `scratch_buf`
-7. **Accumulate** — blends `scratch_buf` (new sample) into a ping-pong
-   accum pair using `mix(history, new_sample, 1/(frame+1))`; the scene
-   converges progressively across frames
-8. **Blit** — fullscreen blit reads the current frame's `rgba16float`
-   accum texture to canvas (Khronos PBR Neutral tonemapping in a later
-   step)
+1. **Ray generation** — pinhole camera, `FrameUniform`-seeded jitter;
+   rays written to GPU storage buffer; throughput initialized to
+   `(1,1,1)`; medium stack pre-seeded with air (`IOR=1.0`)
+2. **Bounce loop (×8)** — each iteration updates `frame_data.bounce`
+   and dispatches:
+   - *BVH traversal* — quadratic sphere intersection, writes one
+     `HitRecord` per ray; miss writes background × throughput to
+     `scratch_buf` and sets termination sentinel
+   - *Diffuse shading* — cosine-weighted hemisphere sample; writes
+     continuation ray and attenuates `ray.throughput`
+   - *Metallic shading* — perfect mirror reflect; attenuates throughput
+   - *Glass shading* — Schlick Fresnel, Snell refraction, TIR,
+     Russian roulette reflect/refract, Beer's law, medium stack push/pop
+   - *Russian roulette* — from bounce 3: survival = max(throughput);
+     terminates low-contribution paths; survivors rescaled by 1/survival
+   - *NEE direct lighting* — shadow ray to point light; Beer's law
+     transmittance through glass; throughput-weighted contribution
+     added to `scratch_buf`
+3. **Accumulate** — blends `scratch_buf` (sum of all bounce
+   contributions) into a ping-pong accum pair via
+   `mix(history, new_sample, 1/(frame+1))`
+4. **Blit** — fullscreen blit reads the current `rgba16float` accum
+   texture to canvas (Khronos PBR Neutral tonemapping in a later step)
 
 Current scene: clear glass sphere (`IOR=1.5`) at origin, radius 0.5;
 warm tan diffuse sphere at y=−1.5, radius 1.0. Point light at (2, 4, 2),
@@ -68,9 +69,14 @@ not affect rendering correctness when working.
 - [x] Step 6d — Glass BSDF: Schlick Fresnel, Snell refraction, TIR,
       medium stack push/pop, Beer's law; sphere is now clear glass
 - [x] Step 7 — Next event estimation: point light, shadow rays, NEE
-      direct kernel; second diffuse sphere; warm background; accum_buf
-- [ ] Step 8 — Sky mask
-- [ ] Step 9 — Temporal accumulation
+      direct kernel; second diffuse sphere; warm background; accum_buf;
+      temporal accumulation (ping-pong blend) rolled in
+- [x] Step 8 — Multi-bounce wavefront loop: `Ray.throughput` in-place
+      mutation, per-bounce `frame_data` updates via separate submits,
+      Russian roulette termination (bounce ≥ 3), additive scratch_buf
+      accumulation across 8 bounces per frame
+      Also, test-scene adjust to include a metallic third sphere
+- [ ] Step 9 — Sky mask
 - [ ] Step 10 — Denoiser
 - [ ] Step 11 — Tone mapping and bloom
 - [ ] Step 12 — Ball animation

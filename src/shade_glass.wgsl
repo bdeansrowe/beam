@@ -23,12 +23,11 @@ fn schlick(cos_theta: f32, n1: f32, n2: f32) -> f32 {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(scratch_buf);
     let px = gid.x;
     let py = gid.y;
-    if px >= dims.x || py >= dims.y { return; }
+    if px >= frame_data.dim_x || py >= frame_data.dim_y { return; }
 
-    let idx = py * dims.x + px;
+    let idx = py * frame_data.dim_x + px;
     let hit = hit_records[idx];
 
     // Skip misses and non-glass hits.
@@ -45,7 +44,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Back-face hit requires depth >= 2: depth-1 is current medium (glass),
     // depth-2 is the medium being re-entered (air or outer dielectric).
     if hit.face_forward == 0u && ray.medium_depth < 2u {
-        textureStore(scratch_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(1.0, 0.0, 1.0, 1.0));
+        scratch_buf[idx] = vec4<f32>(1.0, 0.0, 1.0, 1.0);
         return;
     }
 
@@ -108,14 +107,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let color = throughput * mat.base_color.rgb;
 
-    // ── Write updated ray back for future multi-bounce ─────────────────────────
+    // ── Accumulate Beer's law × base_color into path throughput, write continuation ray ──
     let hit_pos       = hit_position(ray, hit.t);
     let offset_normal = select(-normal, normal, is_reflect);
     ray.origin        = vec4<f32>(offset_ray_origin(hit_pos, offset_normal), ray.origin.w);
     ray.direction     = vec4<f32>(out_dir, ray.direction.w);
+    ray.throughput[0] *= color.r;
+    ray.throughput[1] *= color.g;
+    ray.throughput[2] *= color.b;
     rays[idx]         = ray;
-
-    // ── Single-bounce output: throughput × base_color × background ────────────
-    // When multi-bounce arrives this write moves to the accumulation kernel.
-    textureStore(scratch_buf, vec2<i32>(i32(px), i32(py)), vec4<f32>(color * BACKGROUND.rgb, 1.0));
 }

@@ -6,14 +6,14 @@ struct MediumEntry {
     ior:         f32,
 }  // 8 bytes
 
-// 80 bytes total. _pad uses array<u32,3> (align 4) not vec3<u32> (align 16)
-// so that medium_depth at offset 64 + 4 bytes + 12 bytes pad = 80 exactly.
+// 80 bytes total. throughput uses array<f32,3> (align 4) not vec3<f32> (align 16)
+// so that medium_depth at offset 64 + 4 bytes + throughput 12 bytes = 80 exactly.
 struct Ray {
     origin:       vec4<f32>,             // .w = tmin
     direction:    vec4<f32>,             // .w = tmax
     medium_stack: array<MediumEntry, 4>, // 32 bytes — entries 0..medium_depth-1 active
     medium_depth: u32,                   // 1 = air only
-    _pad:         array<u32, 3>,
+    throughput:   array<f32, 3>,         // path throughput RGB; (1,1,1) at ray birth
 }
 
 struct HitRecord {
@@ -125,8 +125,10 @@ struct LightUniform {
 }  // 48 bytes
 
 struct FrameUniform {
-    frame: u32,
-    _pad:  array<u32, 3>,
+    frame:  u32,
+    dim_x:  u32,
+    dim_y:  u32,
+    bounce: u32,
 }  // 16 bytes
 
 const F32_MAX:      f32       = bitcast<f32>(0x7f7fffffu);

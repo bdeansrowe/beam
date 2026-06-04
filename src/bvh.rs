@@ -14,7 +14,7 @@ pub struct Ray {
     pub direction:    [f32; 4],         // 16 bytes
     pub medium_stack: [MediumEntry; 4], // 32 bytes
     pub medium_depth: u32,              // 4 bytes
-    pub _pad:         [u32; 3],         // 12 bytes → 80 bytes total
+    pub throughput:   [f32; 3],         // 12 bytes → 80 bytes total; path throughput (RGB)
 }
 
 #[repr(u32)]
@@ -133,17 +133,24 @@ pub struct LightUniform {
 
 pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
     let nodes = vec![
-        // Node 0: BLAS leaf — glass sphere at origin, radius 0.5, sphere_index=0
+        // Node 0: BLAS leaf — glass sphere at (0,0.5,0), radius 0.5, sphere_index=0
         BvhNode {
-            aabb_min_left_start:  [-0.5, -0.5, -0.5, f32::from_bits(0)],
-            aabb_max_right_count: [ 0.5,  0.5,  0.5, f32::from_bits(0)],
+            aabb_min_left_start:  [-0.5, 0.0, -0.5, f32::from_bits(0)],
+            aabb_max_right_count: [ 0.5,  1.0,  0.5, f32::from_bits(0)],
             node_type: NODE_LEAF_SPHERE,
             _reserved: [0; 3],
         },
-        // Node 1: BLAS leaf — diffuse sphere at (0,-1.5,0), radius 1.0, sphere_index=1
+        // Node 1: BLAS leaf — diffuse sphere at (0.5,-0.5,0), radius 0.5, sphere_index=1
         BvhNode {
-            aabb_min_left_start:  [-1.0, -2.5, -1.0, f32::from_bits(1)],
-            aabb_max_right_count: [ 1.0, -0.5,  1.0, f32::from_bits(0)],
+            aabb_min_left_start:  [0.1, -1.0, -0.5, f32::from_bits(1)],
+            aabb_max_right_count: [ 1.1, 0.0,  0.5, f32::from_bits(0)],
+            node_type: NODE_LEAF_SPHERE,
+            _reserved: [0; 3],
+        },
+        // Node 2: BLAS leaf — metallic sphere at (-0.5,-0.5,0), radius 0.5, sphere_index=2
+        BvhNode {
+            aabb_min_left_start:  [-1.1, -1.0, -0.5, f32::from_bits(2)],
+            aabb_max_right_count: [ -0.1, 0.0,  0.5, f32::from_bits(0)],
             node_type: NODE_LEAF_SPHERE,
             _reserved: [0; 3],
         },
@@ -159,21 +166,29 @@ pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
     let instances = vec![
         TlasInstance { transform: identity, blas_offset: 0, flags: 0, _reserved: [0; 2] },
         TlasInstance { transform: identity, blas_offset: 1, flags: 0, _reserved: [0; 2] },
+        TlasInstance { transform: identity, blas_offset: 2, flags: 0, _reserved: [0; 2] },
     ];
 
     let spheres = vec![
         // Sphere 0: glass sphere
         Sphere {
-            center_radius:     [0.0, 0.0, 0.0, 0.5],
+            center_radius:     [0.0, 0.5, 0.0, 0.5],
             front_material_id: 1,
             back_material_id:  1,
             _pad:              [0; 2],
         },
-        // Sphere 1: diffuse sphere (externally tangent to glass sphere at y=-0.5)
+        // Sphere 1: diffuse sphere
         Sphere {
-            center_radius:     [0.0, -1.5, 0.0, 1.0],
+            center_radius:     [0.6, -0.5, 0.0, 0.5],
             front_material_id: 2,
             back_material_id:  2,
+            _pad:              [0; 2],
+        },
+        // Sphere 2: metallic sphere
+        Sphere {
+            center_radius:     [-0.6, -0.5, 0.0, 0.5],
+            front_material_id: 3,
+            back_material_id:  3,
             _pad:              [0; 2],
         },
     ];

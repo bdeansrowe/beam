@@ -21,9 +21,9 @@ const HASH_MUL_1: u32 = 0x68b31f7eu;  // PCG-derived bit-mixing constant
 @group(0) @binding(7) var<uniform>       frame_data: FrameUniform;
 
 // ── BG1 — per-pass resources ──────────────────────────────────────────────────
-@group(1) @binding(0) var<storage, read> hit_records: array<HitRecord>;
-@group(1) @binding(1) var                scratch_buf: texture_storage_2d<rgba16float, write>;
-// rays binding declared per-shader with access mode matched to its pipeline layout
+@group(1) @binding(0) var<storage, read>       hit_records: array<HitRecord>;
+@group(1) @binding(1) var<storage, read_write> scratch_buf: array<vec4<f32>>;
+// rays: @group(1) @binding(2) — declared per-shader (read or read_write depending on material)
 
 // ── hit_position ──────────────────────────────────────────────────────────────
 fn hit_position(ray: Ray, t: f32) -> vec3<f32> {
