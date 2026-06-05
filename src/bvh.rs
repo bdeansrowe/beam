@@ -154,6 +154,13 @@ pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
             node_type: NODE_LEAF_SPHERE,
             _reserved: [0; 3],
         },
+        // Node 3: BLAS leaf — air bubble inside glass sphere at (0.2,0.4,0.2), radius 0.1, sphere_index=3
+        BvhNode {
+            aabb_min_left_start:  [0.1, 0.3, 0.1, f32::from_bits(3)],
+            aabb_max_right_count: [0.3, 0.5, 0.3, f32::from_bits(0)],
+            node_type: NODE_LEAF_SPHERE,
+            _reserved: [0; 3],
+        },
     ];
 
     let identity = [
@@ -167,6 +174,7 @@ pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
         TlasInstance { transform: identity, blas_offset: 0, flags: 0, _reserved: [0; 2] },
         TlasInstance { transform: identity, blas_offset: 1, flags: 0, _reserved: [0; 2] },
         TlasInstance { transform: identity, blas_offset: 2, flags: 0, _reserved: [0; 2] },
+        TlasInstance { transform: identity, blas_offset: 3, flags: 0, _reserved: [0; 2] },
     ];
 
     let spheres = vec![
@@ -189,6 +197,13 @@ pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
             center_radius:     [-0.6, -0.5, 0.0, 0.5],
             front_material_id: 3,
             back_material_id:  3,
+            _pad:              [0; 2],
+        },
+        // Sphere 2: air bubble inside glass sphere
+        Sphere {
+            center_radius:     [0.2, 0.4, 0.2, 0.1],
+            front_material_id: 4,
+            back_material_id:  4,
             _pad:              [0; 2],
         },
     ];

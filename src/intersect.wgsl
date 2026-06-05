@@ -18,6 +18,18 @@
 @group(1) @binding(1) var<storage, read_write>  scratch_buf : array<vec4<f32>>;
 @group(1) @binding(2) var<storage, read_write> hit_records : array<HitRecord>;
 
+// ── Procedural spherical checkerboard background ──────────────────────────────
+fn background_color(dir: vec3<f32>) -> vec4<f32> {
+    let d          = normalize(dir);
+    let longitude  = atan2(d.x, d.z);
+    let latitude   = asin(clamp(d.y, -1.0, 1.0));
+    let scale      = PI / 8.0;
+    let checker    = (i32(floor(longitude / scale)) + i32(floor(latitude / scale))) & 1;
+    let royal_blue = vec4<f32>(0.06, 0.12, 0.60, 1.0);
+    let lello      = vec4<f32>(0.96, 0.90, 0.12, 1.0);
+    return select(royal_blue, lello, checker == 1);
+}
+
 // ── BVH traversal — writes one HitRecord per ray into hit_records[idx] ────────
 // Internal state uses anonymous locals; the old traversal-local HitRecord struct
 // (t, normal, hit: bool) is gone — replaced by the buffer HitRecord above.
@@ -110,7 +122,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Miss: add background × path throughput; mark ray terminated so later bounces skip it.
     if hit_records[idx].t >= F32_MAX {
         let tp = rays[idx].throughput;
-        scratch_buf[idx] += BACKGROUND * vec4<f32>(tp[0], tp[1], tp[2], 1.0);
+        scratch_buf[idx] += background_color(rays[idx].direction.xyz) * vec4<f32>(tp[0], tp[1], tp[2], 1.0);
         rays[idx].direction.w = -1.0;
     }
 }

@@ -137,4 +137,3 @@ const MAT_DIFFUSE:  u32       = 0u;
 const MAT_METALLIC: u32       = 1u;
 const MAT_GLASS:    u32       = 2u;
 const MAT_EMISSIVE: u32       = 3u;
-const BACKGROUND:   vec4<f32> = vec4<f32>(0.45, 0.42, 0.38, 1.0);

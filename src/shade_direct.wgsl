@@ -29,6 +29,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                          spheres[hit.prim_idx].front_material_id,
                          hit.face_forward == 1u);
     let mat     = materials[mat_id];
+
+    // Glass transmits rather than scatters — NEE at a glass surface is physically wrong.
+    if mat.material_type == MAT_GLASS { return; }
+
     let hit_pos = hit_position(ray, hit.t);
     let normal  = interpolate_normal(hit, ray);
 
@@ -116,7 +120,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let falloff = 1.0 / (dist * dist);
     let direct  = select(
         vec3<f32>(0.0),
-        light.color.rgb * light.intensity * n_dot_l * falloff * transmittance * mat.base_color.rgb,
+        light.color.rgb * light.intensity * n_dot_l * falloff * transmittance,
         !shadow_blocked,
     ) * vec3<f32>(tp[0], tp[1], tp[2]);
 

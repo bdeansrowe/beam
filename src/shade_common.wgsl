@@ -2,8 +2,7 @@
 // NOT a standalone compute shader — no @compute entry point.
 // Composed into each shade_<variant>.wgsl via string concatenation at pipeline creation.
 // common_common.wgsl is prepended before this file — all shared structs and constants
-// (Ray, HitRecord, Material, Sphere, Vertex, TriangleRecord, F32_MAX, PI, MAT_*,
-// BACKGROUND) are already in scope.
+// (Ray, HitRecord, Material, Sphere, Vertex, TriangleRecord, F32_MAX, PI, MAT_*) are already in scope.
 
 // ── Shade-local constants ─────────────────────────────────────────────────────
 const HASH_MUL_0: u32 = 0xbf324c81u;  // PCG-derived bit-mixing constant
