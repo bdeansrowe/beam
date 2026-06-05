@@ -34,12 +34,16 @@
       last = now;
       smoothMs = smoothMs * 0.9 + delta * 0.1;
       if (++tick % 10 === 0) {
-        const fps   = 1000 / smoothMs;
-        const mrays = (canvas.width * canvas.height * fps) / 1e6;
+        const fps    = 1000 / smoothMs;
+        const mraysS = (canvas.width * canvas.height * fps) / 1e6;
+        const frame  = window.beamFrame != null ? window.beamFrame : '—';
+        const mraysF = window.beamMrays != null ? window.beamMrays.toFixed(2) : '—';
         perf.textContent =
-          ` FPS  ${fps.toFixed(1)}\n` +
-          `  ms  ${smoothMs.toFixed(1)}\n` +
-          `Mrays ${mrays.toFixed(2)}`;
+          `   FPS  ${fps.toFixed(1)}\n` +
+          `    ms  ${smoothMs.toFixed(1)}\n` +
+          `Mrays/s  ${mraysS.toFixed(2)}\n` +
+          ` frame  ${frame}\n` +
+          `Mrays/f  ${mraysF}`;
       }
       requestAnimationFrame(loop);
     }

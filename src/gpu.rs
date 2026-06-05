@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use bytemuck::{Pod, Zeroable};
+use std::cell::RefCell;
 use std::rc::Rc;
 use wgpu::*;
 use winit::{dpi::PhysicalSize, window::Window};
@@ -130,6 +131,12 @@ pub struct GpuState {
     blit_bg0:      BindGroup,
 
     frame: u32,
+
+    // Ray counter (HUD Mrays/frame)
+    ray_counter_buf:         Buffer,
+    ray_counter_staging_buf: Rc<Buffer>,
+    last_mrays_frame:        Rc<RefCell<f32>>,
+    counter_ready:           Rc<RefCell<bool>>,
 }
 
 impl GpuState {
@@ -226,13 +233,26 @@ impl GpuState {
             mapped_at_creation: false,
         });
 
+        let ray_counter_buf = device.create_buffer(&BufferDescriptor {
+            label:              Some("Ray Counter"),
+            size:               4,
+            usage:              BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ray_counter_staging_buf = Rc::new(device.create_buffer(&BufferDescriptor {
+            label:              Some("Ray Counter Staging"),
+            size:               4,
+            usage:              BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+
         let (scratch_buf, intersect_pipeline, intersect_bg1, scene_bg0) =
             Self::create_intersect(
                 &device, &ray_buf,
                 &hit_buf,
                 &bvh_node_buf, &tlas_instance_buf, &sphere_buf,
                 &vertex_buf, &geometry_buf, &material_buf,
-                &light_buf,
+                &ray_counter_buf,
                 &frame_buf,
                 size.width, size.height,
             ).await;
@@ -270,6 +290,9 @@ impl GpuState {
         let (blit_pipeline, blit_bg0) =
             Self::create_blit(&device, &config, &display_tex_view);
 
+        let last_mrays_frame = Rc::new(RefCell::new(0.0f32));
+        let counter_ready    = Rc::new(RefCell::new(true));
+
         log::info!(
             "B09 ready: {}×{} — additive accumulation, resolve pass",
             size.width, size.height,
@@ -292,6 +315,8 @@ impl GpuState {
             resolve_pipeline, resolve_bg0, resolve_bg1,
             blit_pipeline, blit_bg0,
             frame: 0,
+            ray_counter_buf, ray_counter_staging_buf,
+            last_mrays_frame, counter_ready,
         })
     }
 
@@ -587,7 +612,7 @@ impl GpuState {
         vertex_buf:        &Buffer,
         geometry_buf:      &Buffer,
         material_buf:      &Buffer,
-        light_buf:         &Buffer,
+        ray_counter_buf:   &Buffer,
         frame_buf:         &Buffer,
         width:  u32,
         height: u32,
@@ -652,14 +677,6 @@ impl GpuState {
                     count: None,
                 },
                 BindGroupLayoutEntry {
-                    binding: 6, visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false, min_binding_size: None,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
                     binding: 7, visibility: ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
@@ -678,13 +695,12 @@ impl GpuState {
                 BindGroupEntry { binding: 3, resource: vertex_buf.as_entire_binding() },
                 BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
                 BindGroupEntry { binding: 5, resource: material_buf.as_entire_binding() },
-                BindGroupEntry { binding: 6, resource: light_buf.as_entire_binding() },
                 BindGroupEntry { binding: 7, resource: frame_buf.as_entire_binding() },
             ],
         });
 
         // BG1 — per-pass: ray buffer (read_write — intersect writes miss termination sentinel),
-        //               scratch_buf, hit records
+        //               scratch_buf, hit records, ray counter
         let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Intersect BG1"),
             entries: &[
@@ -712,6 +728,14 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 3, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let intersect_bg1 = device.create_bind_group(&BindGroupDescriptor {
@@ -720,6 +744,7 @@ impl GpuState {
                 BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
                 BindGroupEntry { binding: 1, resource: scratch_buf.as_entire_binding() },
                 BindGroupEntry { binding: 2, resource: hit_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: ray_counter_buf.as_entire_binding() },
             ],
         });
 
@@ -1280,6 +1305,9 @@ impl GpuState {
         let cam = CameraUniform::new(self.size.width, self.size.height);
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
 
+        // Reset ray counter before any intersect dispatches this frame.
+        self.queue.write_buffer(&self.ray_counter_buf, 0, bytemuck::bytes_of(&0u32));
+
         let wx = (self.size.width  + 7) / 8;
         let wy = (self.size.height + 7) / 8;
 
@@ -1438,7 +1466,52 @@ impl GpuState {
             self.queue.submit([enc.finish()]);
         }
 
+        // After post-loop: copy ray counter to staging and read back asynchronously.
+        // Skipped if the previous frame's map hasn't completed yet (one frame of latency is fine).
+        if *self.counter_ready.borrow() {
+            *self.counter_ready.borrow_mut() = false;
+            let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Counter Readback"),
+            });
+            enc.copy_buffer_to_buffer(
+                &self.ray_counter_buf, 0,
+                &*self.ray_counter_staging_buf, 0,
+                4,
+            );
+            self.queue.submit([enc.finish()]);
+
+            let staging  = Rc::clone(&self.ray_counter_staging_buf);
+            let mrays    = Rc::clone(&self.last_mrays_frame);
+            let ready    = Rc::clone(&self.counter_ready);
+            self.ray_counter_staging_buf.slice(..).map_async(MapMode::Read, move |result| {
+                if result.is_ok() {
+                    let view  = staging.slice(..).get_mapped_range();
+                    let count = u32::from_le_bytes([view[0], view[1], view[2], view[3]]);
+                    drop(view);
+                    staging.unmap();
+                    *mrays.borrow_mut() = count as f32 / 1_000_000.0;
+                }
+                *ready.borrow_mut() = true;
+            });
+        }
+
         self.frame += 1;
+
+        // Expose frame counter and Mrays/frame to the JS HUD overlay.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(window) = web_sys::window() {
+            let _ = js_sys::Reflect::set(
+                window.as_ref(),
+                &wasm_bindgen::JsValue::from_str("beamFrame"),
+                &wasm_bindgen::JsValue::from_f64(self.frame as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                window.as_ref(),
+                &wasm_bindgen::JsValue::from_str("beamMrays"),
+                &wasm_bindgen::JsValue::from_f64(*self.last_mrays_frame.borrow() as f64),
+            );
+        }
+
         output.present();
         Ok(())
     }

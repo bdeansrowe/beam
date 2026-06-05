@@ -8,15 +8,14 @@
 @group(0) @binding(4) var<storage, read> geometry       : array<TriangleRecord>;
 // Step 6 — declared, not yet used
 @group(0) @binding(5) var<storage, read> materials      : array<Material>;
-// Step 7 — declared, not yet used
-@group(0) @binding(6) var<storage, read> lights         : array<LightUniform>;
 // B07a — declared, not yet used
 @group(0) @binding(7) var<uniform>       frame_data     : FrameUniform;
 
 // group(1) = per-pass resources
 @group(1) @binding(0) var<storage, read_write>  rays        : array<Ray>;
 @group(1) @binding(1) var<storage, read_write>  scratch_buf : array<vec4<f32>>;
-@group(1) @binding(2) var<storage, read_write> hit_records : array<HitRecord>;
+@group(1) @binding(2) var<storage, read_write>  hit_records : array<HitRecord>;
+@group(1) @binding(3) var<storage, read_write>  ray_counter : atomic<u32>;
 
 // ── Procedural spherical checkerboard background ──────────────────────────────
 fn background_color(dir: vec3<f32>) -> vec4<f32> {
@@ -108,6 +107,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         hit_records[idx] = HitRecord(F32_MAX, 0u, vec2<f32>(0.0), 0u, 0u, 0u, 0u);
         return;
     }
+
+    atomicAdd(&ray_counter, 1u);
 
     let ray = rays[idx];
 
