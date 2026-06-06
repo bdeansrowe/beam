@@ -5,12 +5,15 @@
 @group(0) @binding(0) var<uniform>       frame_data:  FrameUniform;
 @group(1) @binding(0) var<storage, read> accum_buf:   array<vec4<f32>>;
 @group(1) @binding(1) var                display_tex: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(2) var<storage, read> sky_mask:    array<u32>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gid.x >= frame_data.dim_x || gid.y >= frame_data.dim_y { return; }
-    let idx    = gid.y * frame_data.dim_x + gid.x;
-    let coord  = vec2<i32>(i32(gid.x), i32(gid.y));
-    let weight = 1.0 / f32(frame_data.frame + 1u);
+    let idx   = gid.y * frame_data.dim_x + gid.x;
+    let coord = vec2<i32>(i32(gid.x), i32(gid.y));
+    // Sky pixels (sky_mask == 0): display the frame-0 background unchanged.
+    // Geometry pixels: running average over all accumulated frames.
+    let weight = select(1.0 / f32(frame_data.frame + 1u), 1.0, sky_mask[idx] == 0u);
     textureStore(display_tex, coord, accum_buf[idx] * weight);
 }

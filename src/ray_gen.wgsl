@@ -11,6 +11,7 @@ struct Camera {
 @group(0) @binding(0) var<uniform>             camera     : Camera;
 @group(0) @binding(1) var<uniform>             frame_data : FrameUniform;
 @group(1) @binding(0) var<storage, read_write> rays       : array<Ray>;
+@group(1) @binding(1) var<storage, read>       sky_mask   : array<u32>;
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -19,6 +20,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let w  = camera.dims.x;
     let h  = camera.dims.y;
     if px >= w || py >= h { return; }
+
+    let idx = py * w + px;
+    if frame_data.frame > 0u && sky_mask[idx] == 0u { return; }
 
     let jitter = halton2(frame_data.frame);
     let u =       (f32(px) + jitter.x) / f32(w);
@@ -29,7 +33,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                      + v * camera.vertical.xyz;
     let dir = normalize(img_plane_pos - camera.origin.xyz);
 
-    let idx = py * w + px;
     var r: Ray;
     r.origin             = vec4<f32>(camera.origin.xyz, 1e-4);
     r.direction          = vec4<f32>(dir, 1e30);

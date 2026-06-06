@@ -60,6 +60,13 @@ pub struct GpuState {
     ray_gen_bg0:      BindGroup,
     ray_gen_bg1:      BindGroup,
 
+    // Sky mask (Step 9)
+    #[allow(dead_code)]
+    sky_mask_buf:          Buffer,
+    sky_mask_init_pipeline: ComputePipeline,
+    sky_mask_init_bg0:      BindGroup,
+    sky_mask_init_bg1:      BindGroup,
+
     // BVH scene buffers (Step 5)
     #[allow(dead_code)]
     bvh_node_buf:      Buffer,
@@ -211,11 +218,25 @@ impl GpuState {
             mapped_at_creation: false,
         });
 
+        let sky_mask_buf = device.create_buffer(&BufferDescriptor {
+            label:              Some("Sky Mask Buffer"),
+            size:               (size.width * size.height) as u64 * 4,
+            usage:              BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         let (ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf) =
-            Self::create_ray_gen(&device, size.width, size.height, &frame_buf);
+            Self::create_ray_gen(&device, size.width, size.height, &frame_buf, &sky_mask_buf);
 
         let (bvh_node_buf, tlas_instance_buf, sphere_buf, vertex_buf, geometry_buf, material_buf) =
             Self::create_bvh_buffers(&device);
+
+        let (sky_mask_init_pipeline, sky_mask_init_bg0, sky_mask_init_bg1) =
+            Self::create_sky_mask_init(
+                &device, &camera_buf, &frame_buf,
+                &bvh_node_buf, &tlas_instance_buf, &sphere_buf,
+                &sky_mask_buf,
+            ).await;
 
         let light_buf = Self::upload_slice(&device, "Light Buffer", &[LightUniform {
             // position:  [0.0, 0.0, 5.0, 0.0],
@@ -285,7 +306,7 @@ impl GpuState {
             Self::create_accumulate(&device, &frame_buf, &scratch_buf, size.width, size.height).await;
 
         let (resolve_pipeline, resolve_bg0, resolve_bg1, display_tex, display_tex_view) =
-            Self::create_resolve(&device, &frame_buf, &accum_buf, size.width, size.height).await;
+            Self::create_resolve(&device, &frame_buf, &accum_buf, &sky_mask_buf, size.width, size.height).await;
 
         let (blit_pipeline, blit_bg0) =
             Self::create_blit(&device, &config, &display_tex_view);
@@ -301,6 +322,7 @@ impl GpuState {
         Ok(Self {
             surface, device, queue, config, size,
             camera_buf, frame_buf, ray_buf, ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1,
+            sky_mask_buf, sky_mask_init_pipeline, sky_mask_init_bg0, sky_mask_init_bg1,
             bvh_node_buf, tlas_instance_buf, sphere_buf,
             vertex_buf, geometry_buf, material_buf, light_buf,
             hit_buf,
@@ -396,7 +418,7 @@ impl GpuState {
     }
 
     fn create_ray_gen(
-        device: &Device, width: u32, height: u32, frame_buf: &Buffer,
+        device: &Device, width: u32, height: u32, frame_buf: &Buffer, sky_mask_buf: &Buffer,
     ) -> (ComputePipeline, BindGroup, BindGroup, Buffer, Buffer) {
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Ray Gen BG0"),
@@ -421,14 +443,24 @@ impl GpuState {
         });
         let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Ray Gen BG1"),
-            entries: &[BindGroupLayoutEntry {
-                binding: 0, visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false, min_binding_size: None,
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
         });
 
         let camera_buf = device.create_buffer(&BufferDescriptor {
@@ -453,7 +485,10 @@ impl GpuState {
         });
         let ray_gen_bg1 = device.create_bind_group(&BindGroupDescriptor {
             label: Some("Ray Gen BG1"), layout: &bg1_layout,
-            entries: &[BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() }],
+            entries: &[
+                BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: sky_mask_buf.as_entire_binding() },
+            ],
         });
 
         let ray_gen_src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("ray_gen.wgsl"));
@@ -472,6 +507,118 @@ impl GpuState {
         });
 
         (pipeline, ray_gen_bg0, ray_gen_bg1, camera_buf, ray_buf)
+    }
+
+    async fn create_sky_mask_init(
+        device:            &Device,
+        camera_buf:        &Buffer,
+        frame_buf:         &Buffer,
+        bvh_node_buf:      &Buffer,
+        tlas_instance_buf: &Buffer,
+        sphere_buf:        &Buffer,
+        sky_mask_buf:      &Buffer,
+    ) -> (ComputePipeline, BindGroup, BindGroup) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Sky Mask Init BG0"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 4, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Sky Mask Init BG1"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let sky_mask_init_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Sky Mask Init BG0"), layout: &bg0_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: frame_buf.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: bvh_node_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: tlas_instance_buf.as_entire_binding() },
+                BindGroupEntry { binding: 4, resource: sphere_buf.as_entire_binding() },
+            ],
+        });
+        let sky_mask_init_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Sky Mask Init BG1"), layout: &bg1_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: sky_mask_buf.as_entire_binding() }],
+        });
+
+        let src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("sky_mask_init.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Sky Mask Init"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
+        });
+        let info = shader.get_compilation_info().await;
+        for msg in &info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("sky_mask_init.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("sky_mask_init.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Sky Mask Init Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Sky Mask Init"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Sky Mask Init pipeline validation error: {:?}", err);
+        }
+
+        (pipeline, sky_mask_init_bg0, sky_mask_init_bg1)
     }
 
     async fn create_clear_pass(
@@ -879,11 +1026,12 @@ impl GpuState {
     }
 
     async fn create_resolve(
-        device:    &Device,
-        frame_buf: &Buffer,
-        accum_buf: &Buffer,
-        width:     u32,
-        height:    u32,
+        device:        &Device,
+        frame_buf:     &Buffer,
+        accum_buf:     &Buffer,
+        sky_mask_buf:  &Buffer,
+        width:         u32,
+        height:        u32,
     ) -> (ComputePipeline, BindGroup, BindGroup, Texture, TextureView) {
         let display_tex = device.create_texture(&TextureDescriptor {
             label:           Some("Display Texture"),
@@ -928,6 +1076,14 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 2, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -940,6 +1096,7 @@ impl GpuState {
             entries: &[
                 BindGroupEntry { binding: 0, resource: accum_buf.as_entire_binding() },
                 BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&display_tex_view) },
+                BindGroupEntry { binding: 2, resource: sky_mask_buf.as_entire_binding() },
             ],
         });
 
@@ -1331,6 +1488,15 @@ impl GpuState {
             let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Pre-Loop Encoder"),
             });
+            if self.frame == 0 {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Sky Mask Init"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.sky_mask_init_pipeline);
+                cpass.set_bind_group(0, &self.sky_mask_init_bg0, &[]);
+                cpass.set_bind_group(1, &self.sky_mask_init_bg1, &[]);
+                cpass.dispatch_workgroups(wx, wy, 1);
+            }
             {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
                     label: Some("Clear Pass"), timestamp_writes: None,
