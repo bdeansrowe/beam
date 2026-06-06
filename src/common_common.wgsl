@@ -131,6 +131,14 @@ struct FrameUniform {
     bounce: u32,
 }  // 16 bytes
 
+const FIBONACCI_HASH: u32 = 0x9e3779b9u;  // 2^32 / phi — Knuth Vol. 3
+
+fn pcg_hash(v: u32) -> u32 {
+    let state = v * 747796405u + 2891336453u;
+    let word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
 const F32_MAX:      f32       = bitcast<f32>(0x7f7fffffu);
 const PI:           f32       = 3.14159265358979323846;
 const MAT_DIFFUSE:  u32       = 0u;
