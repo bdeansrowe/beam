@@ -47,7 +47,7 @@ work around co-author artifacts unilaterally.
 ## Dev Commands
 
 ```bash
-# Build WASM and serve on http://localhost:9000 (requires wasm-pack + basic-http-server)
+# Build WASM and serve on http://localhost:9666 (requires wasm-pack + basic-http-server)
 ./build.sh
 
 # Build only (no serve)
@@ -101,7 +101,7 @@ The following Markdown files in the repo root are design/context documents from 
 - **Stack:** Rust, wgpu 27, winit 0.30, wasm-bindgen, wasm-pack
 - **Render architecture:** Wavefront compute pipeline → HDR storage
   texture → blit to canvas
-- **Dev server:** Simple HTTP server on port 9000
+- **Dev server:** Simple HTTP server on port 9666
 - **Dev environment:** Vivaldi (Chromium 144) on ARM64 Mac (M2 MacBook Air, 10-core GPU)
 - **Project structure:** `src/` (lib.rs, app.rs, gpu.rs, shader.wgsl) and
   `web/` (index.html, pkg/) — this directory is the project root
