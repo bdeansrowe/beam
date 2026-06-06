@@ -1133,16 +1133,18 @@ impl GpuState {
             ],
         });
 
-        // Compose common_common.wgsl + shade_common.wgsl + shade_<variant>.wgsl
+        // Compose common_common.wgsl + shade_common.wgsl + mesh_common.wgsl + shade_<variant>.wgsl
+        // mesh_common.wgsl declares bindings 3/4 (vertex_buf, geometry_buf) — omitted from shade_direct.
         let common_common = include_str!("common_common.wgsl");
         let shade_common  = include_str!("shade_common.wgsl");
+        let mesh_common   = include_str!("mesh_common.wgsl");
         let diffuse       = include_str!("shade_diffuse.wgsl");
         let metallic      = include_str!("shade_metallic.wgsl");
         let glass         = include_str!("shade_glass.wgsl");
 
-        let diffuse_src  = format!("{}\n{}\n{}", common_common, shade_common, diffuse);
-        let metallic_src = format!("{}\n{}\n{}", common_common, shade_common, metallic);
-        let glass_src    = format!("{}\n{}\n{}", common_common, shade_common, glass);
+        let diffuse_src  = format!("{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, diffuse);
+        let metallic_src = format!("{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, metallic);
+        let glass_src    = format!("{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, glass);
 
         let diffuse_module = device.create_shader_module(ShaderModuleDescriptor {
             label:  Some("Shade Diffuse"),
@@ -1216,7 +1218,8 @@ impl GpuState {
             log::error!("Shade Glass pipeline validation error: {:?}", err);
         }
 
-        // ── shade_direct: full BG0 (bindings 0-6) for shadow ray BVH traversal ─
+        // ── shade_direct: BG0 for shadow ray BVH traversal ───────────────────────
+        // Omits bindings 3/4 (vertices, geometry) — shadow rays never touch mesh data.
         let sd_storage_ro = |binding: u32| BindGroupLayoutEntry {
             binding, visibility: ShaderStages::COMPUTE,
             ty: BindingType::Buffer {
@@ -1229,8 +1232,7 @@ impl GpuState {
             label:   Some("Shade Direct BG0"),
             entries: &[
                 sd_storage_ro(0), sd_storage_ro(1), sd_storage_ro(2),
-                sd_storage_ro(3), sd_storage_ro(4), sd_storage_ro(5),
-                sd_storage_ro(6),
+                sd_storage_ro(5), sd_storage_ro(6),
                 BindGroupLayoutEntry {
                     binding: 7, visibility: ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
@@ -1247,8 +1249,6 @@ impl GpuState {
                 BindGroupEntry { binding: 0, resource: bvh_node_buf.as_entire_binding() },
                 BindGroupEntry { binding: 1, resource: tlas_instance_buf.as_entire_binding() },
                 BindGroupEntry { binding: 2, resource: sphere_buf.as_entire_binding() },
-                BindGroupEntry { binding: 3, resource: vertex_buf.as_entire_binding() },
-                BindGroupEntry { binding: 4, resource: geometry_buf.as_entire_binding() },
                 BindGroupEntry { binding: 5, resource: material_buf.as_entire_binding() },
                 BindGroupEntry { binding: 6, resource: light_buf.as_entire_binding() },
                 BindGroupEntry { binding: 7, resource: frame_buf.as_entire_binding() },

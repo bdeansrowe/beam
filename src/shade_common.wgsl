@@ -10,10 +10,9 @@ const HASH_MUL_1: u32 = 0x68b31f7eu;  // PCG-derived bit-mixing constant
 
 // ── BG0 — scene resources used by shading kernels ─────────────────────────────
 // Bindings 0 (bvh_nodes) and 1 (tlas_instances) are intersect-only — not declared here.
-// Step 7 creates a separate shade_scene_bg0 BindGroup covering only these four slots.
+// Bindings 3 (vertices) and 4 (geometry) are in mesh_common.wgsl — composed into
+// material shaders that may access triangle geometry, but NOT into shade_direct.
 @group(0) @binding(2) var<storage, read> spheres  : array<Sphere>;
-@group(0) @binding(3) var<storage, read> vertices : array<Vertex>;
-@group(0) @binding(4) var<storage, read> geometry : array<TriangleRecord>;
 @group(0) @binding(5) var<storage, read> materials: array<Material>;
 // Step 7 — declared, not yet used by diffuse/metallic/glass kernels
 @group(0) @binding(6) var<storage, read> lights:    array<LightUniform>;
