@@ -22,7 +22,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if px >= w || py >= h { return; }
 
     let idx = py * w + px;
-    if frame_data.frame > 0u && sky_mask[idx] == 0u { return; }
+    if sky_mask[idx] == 0u { return; }
 
     let jitter = halton2(frame_data.frame);
     let u =       (f32(px) + jitter.x) / f32(w);
@@ -42,21 +42,3 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     rays[idx] = r;
 }
 
-// Radical-inverse Halton sequence for sub-pixel jitter.
-fn halton(i: u32, base: u32) -> f32 {
-    var f = 1.0;
-    var r = 0.0;
-    var n = i;
-    loop {
-        f /= f32(base);
-        r += f * f32(n % base);
-        n /= base;
-        if n == 0u { break; }
-    }
-    return r;
-}
-
-fn halton2(frame: u32) -> vec2<f32> {
-    // +1 so frame 0 yields (0.5, 0.33…) rather than (0, 0)
-    return vec2<f32>(halton(frame + 1u, 2u), halton(frame + 1u, 3u));
-}

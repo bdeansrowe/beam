@@ -52,6 +52,18 @@ fn hash_u32(x: u32) -> u32 {
     return v;
 }
 
+// ── pixel_seed ────────────────────────────────────────────────────────────────
+// Canonical per-pixel RNG seed. Hashes px and py independently to break
+// the spatial correlation that arises from seeding on a linear pixel index.
+// All shading kernels must use this function rather than constructing seeds
+// from idx directly.
+fn pixel_seed(px: u32, py: u32) -> u32 {
+    let spatial = pcg_hash(px) ^ (pcg_hash(py) * FIBONACCI_HASH);
+    return spatial
+         ^ pcg_hash(frame_data.frame << 16u)
+         ^ pcg_hash(frame_data.bounce * FIBONACCI_HASH);
+}
+
 fn cosine_weighted_hemisphere(normal: vec3<f32>, seed: u32) -> vec3<f32> {
     let r1  = f32(hash_u32(seed)      & 0x00ffffffu) / f32(0x01000000u);
     let r2  = f32(hash_u32(seed + 1u) & 0x00ffffffu) / f32(0x01000000u);

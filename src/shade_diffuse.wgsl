@@ -25,7 +25,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let normal  = interpolate_normal(hit, ray);
     let hit_pos = hit_position(ray, hit.t);
 
-    let seed    = pcg_hash(idx) ^ pcg_hash(frame_data.frame << 16u) ^ pcg_hash(frame_data.bounce * FIBONACCI_HASH);
+    let seed    = pixel_seed(px, py);
     let new_dir = cosine_weighted_hemisphere(normal, seed);
 
     ray.origin        = vec4<f32>(offset_ray_origin(hit_pos, normal), ray.origin.w);

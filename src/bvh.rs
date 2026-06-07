@@ -199,10 +199,10 @@ pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
         0.0, 0.0, 0.0, 1.0_f32,
     ];
 
-    let two_thirds_scale = [
-        2.0/3.0, 0.0, 0.0, 0.0,
-        0.0, 2.0/3.0, 0.0, 0.0,
-        0.0, 0.0, 2.0/3.0, 0.0,
+    let two_thirds_xz_scale = [
+        5.0/4.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 5.0/4.0, 0.0,
         0.0, 0.0, 0.0, 1.0_f32,
     ];
 
@@ -211,8 +211,8 @@ pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
         TlasInstance { transform: identity, blas_offset: 1, flags: 0, _reserved: [0; 2] },
         TlasInstance { transform: identity, blas_offset: 2, flags: 0, _reserved: [0; 2] },
         TlasInstance { transform: identity, blas_offset: 3, flags: 0, _reserved: [0; 2] },
-        TlasInstance { transform: identity, blas_offset: 4, flags: 0, _reserved: [0; 2] },
-        TlasInstance { transform: identity, blas_offset: 5, flags: 0, _reserved: [0; 2] },
+        TlasInstance { transform: two_thirds_xz_scale, blas_offset: 4, flags: 0, _reserved: [0; 2] },
+        TlasInstance { transform: two_thirds_xz_scale, blas_offset: 5, flags: 0, _reserved: [0; 2] },
     ];
 
     let spheres = vec![

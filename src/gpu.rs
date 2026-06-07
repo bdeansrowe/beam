@@ -67,6 +67,16 @@ pub struct GpuState {
     sky_mask_init_bg0:      BindGroup,
     sky_mask_init_bg1:      BindGroup,
 
+    // Background supersampling — frame-0 pre-loop, frozen sky pixels
+    background_preshader_pipeline: ComputePipeline,
+    background_preshader_bg0:      BindGroup,
+    background_preshader_bg1:      BindGroup,
+
+    // Background in-loop — per-bounce escaped-ray contribution
+    background_shader_pipeline: ComputePipeline,
+    background_shader_bg0:      BindGroup,
+    background_shader_bg1:      BindGroup,
+
     // BVH scene buffers (Step 5)
     #[allow(dead_code)]
     bvh_node_buf:      Buffer,
@@ -184,6 +194,9 @@ impl GpuState {
                 required_features: Features::empty(),
                 // BG0 has 9 storage buffers in the intersect stage (default limit is 8).
                 // The adapter reports supporting 10, so this is safe on target hardware.
+                // shade_direct is at 8 storage buffers per shader stage (default limit).
+                // intersect dropped below the default limit after scratch_buf was removed
+                // from its BG1; shade_direct drives the requirement to keep this at 10.
                 required_limits: Limits {
                     max_storage_buffers_per_shader_stage: 10,
                     ..Limits::default()
@@ -278,6 +291,16 @@ impl GpuState {
                 size.width, size.height,
             ).await;
 
+        let (background_preshader_pipeline, background_preshader_bg0, background_preshader_bg1) =
+            Self::create_background_preshader(
+                &device, &camera_buf, &frame_buf, &sky_mask_buf, &scratch_buf,
+            ).await;
+
+        let (background_shader_pipeline, background_shader_bg0, background_shader_bg1) =
+            Self::create_background_shader(
+                &device, &frame_buf, &hit_buf, &scratch_buf, &ray_buf,
+            ).await;
+
         let (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline,
              shade_direct_pipeline,
              shade_scene_bg0, shade_direct_bg0, shade_bg1_rw) =
@@ -323,6 +346,8 @@ impl GpuState {
             surface, device, queue, config, size,
             camera_buf, frame_buf, ray_buf, ray_gen_pipeline, ray_gen_bg0, ray_gen_bg1,
             sky_mask_buf, sky_mask_init_pipeline, sky_mask_init_bg0, sky_mask_init_bg1,
+            background_preshader_pipeline, background_preshader_bg0, background_preshader_bg1,
+            background_shader_pipeline, background_shader_bg0, background_shader_bg1,
             bvh_node_buf, tlas_instance_buf, sphere_buf,
             vertex_buf, geometry_buf, material_buf, light_buf,
             hit_buf,
@@ -621,6 +646,194 @@ impl GpuState {
         (pipeline, sky_mask_init_bg0, sky_mask_init_bg1)
     }
 
+    async fn create_background_preshader(
+        device:       &Device,
+        camera_buf:   &Buffer,
+        frame_buf:    &Buffer,
+        sky_mask_buf: &Buffer,
+        scratch_buf:  &Buffer,
+    ) -> (ComputePipeline, BindGroup, BindGroup) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Background Preshader BG0"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Background Preshader BG1"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let background_preshader_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Background Preshader BG0"), layout: &bg0_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: frame_buf.as_entire_binding() },
+            ],
+        });
+        let background_preshader_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Background Preshader BG1"), layout: &bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: sky_mask_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: scratch_buf.as_entire_binding() },
+            ],
+        });
+
+        let src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("background_preshader.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Background Preshader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
+        });
+        let info = shader.get_compilation_info().await;
+        for msg in &info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("background_preshader.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("background_preshader.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Background Preshader Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Background Preshader"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Background Preshader pipeline validation error: {:?}", err);
+        }
+
+        (pipeline, background_preshader_bg0, background_preshader_bg1)
+    }
+
+    async fn create_background_shader(
+        device:      &Device,
+        frame_buf:   &Buffer,
+        hit_buf:     &Buffer,
+        scratch_buf: &Buffer,
+        ray_buf:     &Buffer,
+    ) -> (ComputePipeline, BindGroup, BindGroup) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Background Shader BG0"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Background Shader BG1"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let background_shader_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Background Shader BG0"), layout: &bg0_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() }],
+        });
+        let background_shader_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Background Shader BG1"), layout: &bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: hit_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: scratch_buf.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: ray_buf.as_entire_binding() },
+            ],
+        });
+
+        let src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("background_shader.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Background Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
+        });
+        let info = shader.get_compilation_info().await;
+        for msg in &info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("background_shader.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("background_shader.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Background Shader Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Background Shader"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Background Shader pipeline validation error: {:?}", err);
+        }
+
+        (pipeline, background_shader_bg0, background_shader_bg1)
+    }
+
     async fn create_clear_pass(
         device:     &Device,
         frame_buf:  &Buffer,
@@ -846,21 +1059,13 @@ impl GpuState {
             ],
         });
 
-        // BG1 — per-pass: ray buffer (read_write — intersect writes miss termination sentinel),
-        //               scratch_buf, hit records, ray counter
+        // BG1 — per-pass: rays (miss termination sentinel), hit records, ray counter.
+        // scratch_buf removed — background_shader owns sky-pixel writes on frame 0.
         let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Intersect BG1"),
             entries: &[
                 BindGroupLayoutEntry {
                     binding: 0, visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false, min_binding_size: None,
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1, visibility: ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false, min_binding_size: None,
@@ -889,7 +1094,6 @@ impl GpuState {
             label: Some("Intersect BG1"), layout: &bg1_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: scratch_buf.as_entire_binding() },
                 BindGroupEntry { binding: 2, resource: hit_buf.as_entire_binding() },
                 BindGroupEntry { binding: 3, resource: ray_counter_buf.as_entire_binding() },
             ],
@@ -1506,6 +1710,15 @@ impl GpuState {
                 cpass.set_bind_group(1, &self.clear_bg1, &[]);
                 cpass.dispatch_workgroups(wx, wy, 1);
             }
+            if self.frame == 0 {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Background Preshader"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.background_preshader_pipeline);
+                cpass.set_bind_group(0, &self.background_preshader_bg0, &[]);
+                cpass.set_bind_group(1, &self.background_preshader_bg1, &[]);
+                cpass.dispatch_workgroups(wx, wy, 1);
+            }
             {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
                     label: Some("Ray Gen"), timestamp_writes: None,
@@ -1538,6 +1751,15 @@ impl GpuState {
                 cpass.set_pipeline(&self.intersect_pipeline);
                 cpass.set_bind_group(0, &self.scene_bg0, &[]);
                 cpass.set_bind_group(1, &self.intersect_bg1, &[]);
+                cpass.dispatch_workgroups(wx, wy, 1);
+            }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Background Shader"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.background_shader_pipeline);
+                cpass.set_bind_group(0, &self.background_shader_bg0, &[]);
+                cpass.set_bind_group(1, &self.background_shader_bg1, &[]);
                 cpass.dispatch_workgroups(wx, wy, 1);
             }
             {

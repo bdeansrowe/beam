@@ -148,3 +148,39 @@ const MAT_DIFFUSE:  u32       = 0u;
 const MAT_METALLIC: u32       = 1u;
 const MAT_GLASS:    u32       = 2u;
 const MAT_EMISSIVE: u32       = 3u;
+
+// ── Halton low-discrepancy sequence ──────────────────────────────────────────
+// Canonical definition — used by ray_gen, sky_mask_init, and background_shader.
+fn halton(i: u32, base: u32) -> f32 {
+    var f = 1.0;
+    var r = 0.0;
+    var n = i;
+    loop {
+        f /= f32(base);
+        r += f * f32(n % base);
+        n /= base;
+        if n == 0u { break; }
+    }
+    return r;
+}
+
+fn halton2(frame: u32) -> vec2<f32> {
+    // +1 so frame 0 yields (0.5, 0.33…) rather than (0, 0).
+    return vec2<f32>(halton(frame + 1u, 2u), halton(frame + 1u, 3u));
+}
+
+// ── Procedural spherical checkerboard background ──────────────────────────────
+// Canonical definition — used by background_shader.
+// intersect no longer calls this — background shading is owned
+// exclusively by background_shader.
+fn background_color(dir: vec3<f32>) -> vec4<f32> {
+    let d          = normalize(dir);
+    let longitude  = atan2(d.x, d.z);
+    let latitude   = asin(clamp(d.y, -1.0, 1.0));
+    let scale      = PI / 8.0;
+    let checker    = (i32(floor(longitude / scale))
+                   +  i32(floor(latitude  / scale))) & 1;
+    let royal_blue = vec4<f32>(0.06, 0.12, 0.60, 1.0);
+    let lello      = vec4<f32>(0.96, 0.90, 0.12, 1.0);
+    return select(royal_blue, lello, checker == 1);
+}

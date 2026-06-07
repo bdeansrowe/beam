@@ -67,25 +67,6 @@ fn traverse_bvh_any_hit(origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f32)
     return false;
 }
 
-// ── Halton low-discrepancy sequence for sub-pixel jitter ─────────────────────
-// Matches ray_gen.wgsl so the frame-0 ray direction is identical to ray_gen's.
-fn halton(i: u32, base: u32) -> f32 {
-    var f = 1.0;
-    var r = 0.0;
-    var n = i;
-    loop {
-        f /= f32(base);
-        r += f * f32(n % base);
-        n /= base;
-        if n == 0u { break; }
-    }
-    return r;
-}
-
-fn halton2(frame: u32) -> vec2<f32> {
-    return vec2<f32>(halton(frame + 1u, 2u), halton(frame + 1u, 3u));
-}
-
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = gid.x;
