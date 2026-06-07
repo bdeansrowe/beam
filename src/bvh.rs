@@ -1,5 +1,8 @@
 use bytemuck::{Pod, Zeroable};
 
+/// Medium stack depth. Must match MEDIUM_STACK_DEPTH in common_common.wgsl.
+pub const MEDIUM_STACK_DEPTH: usize = 8;
+
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct MediumEntry {
@@ -10,11 +13,11 @@ pub struct MediumEntry {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct Ray {
-    pub origin:       [f32; 4],         // 16 bytes
-    pub direction:    [f32; 4],         // 16 bytes
-    pub medium_stack: [MediumEntry; 4], // 32 bytes
-    pub medium_depth: u32,              // 4 bytes
-    pub throughput:   [f32; 3],         // 12 bytes → 80 bytes total; path throughput (RGB)
+    pub origin:       [f32; 4],                          // 16 bytes
+    pub direction:    [f32; 4],                          // 16 bytes
+    pub medium_stack: [MediumEntry; MEDIUM_STACK_DEPTH], // 64 bytes
+    pub medium_depth: u32,                               // 4 bytes
+    pub throughput:   [f32; 3],                          // 12 bytes → 112 bytes total; path throughput (RGB)
 }
 
 #[repr(u32)]
@@ -132,32 +135,58 @@ pub struct LightUniform {
 // Rust [f32;7] at offset 36 covers the implicit gap + the vec3 + tail pad.
 
 pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
+    let s012_radius = 0.3333;
+    let s3_radius = s012_radius/6.0;
+    let s0_centre = -s012_radius;
+    let s12_centre = -1.0;
+    let s3_centre = s0_centre-0.1;
+    let s4_centre = -s012_radius/2.0;
+    let s4_radius = 1.0+s012_radius;
+    let s5_centre = -3.0*s012_radius/2.0;
+    let s5_radius = 1.0;
     let nodes = vec![
         // Node 0: BLAS leaf — glass sphere at (0,0.5,0), radius 0.5, sphere_index=0
         BvhNode {
-            aabb_min_left_start:  [-0.5, 0.0, -0.5, f32::from_bits(0)],
-            aabb_max_right_count: [ 0.5,  1.0,  0.5, f32::from_bits(0)],
+            aabb_min_left_start:  [0.0-s012_radius, s0_centre-s012_radius, 0.0-s012_radius, f32::from_bits(0)],
+            aabb_max_right_count: [0.0+s012_radius, s0_centre+s012_radius, 0.0+s012_radius, f32::from_bits(0)],
             node_type: NODE_LEAF_SPHERE,
             _reserved: [0; 3],
         },
         // Node 1: BLAS leaf — diffuse sphere at (0.5,-0.5,0), radius 0.5, sphere_index=1
         BvhNode {
-            aabb_min_left_start:  [0.1, -1.0, -0.5, f32::from_bits(1)],
-            aabb_max_right_count: [ 1.1, 0.0,  0.5, f32::from_bits(0)],
+            aabb_min_left_start:  [s012_radius-s012_radius+0.05, s12_centre-s012_radius, 0.0-s012_radius, f32::from_bits(1)],
+            aabb_max_right_count: [s012_radius+s012_radius+0.05, s12_centre+s012_radius, 0.0+s012_radius, f32::from_bits(0)],
             node_type: NODE_LEAF_SPHERE,
             _reserved: [0; 3],
         },
         // Node 2: BLAS leaf — metallic sphere at (-0.5,-0.5,0), radius 0.5, sphere_index=2
         BvhNode {
-            aabb_min_left_start:  [-1.1, -1.0, -0.5, f32::from_bits(2)],
-            aabb_max_right_count: [ -0.1, 0.0,  0.5, f32::from_bits(0)],
+            aabb_min_left_start:  [-s012_radius-s012_radius-0.05, s12_centre-s012_radius, 0.0-s012_radius, f32::from_bits(2)],
+            aabb_max_right_count: [-s012_radius+s012_radius-0.05, s12_centre+s012_radius, 0.0+s012_radius, f32::from_bits(0)],
             node_type: NODE_LEAF_SPHERE,
             _reserved: [0; 3],
         },
         // Node 3: BLAS leaf — air bubble inside glass sphere at (0.2,0.4,0.2), radius 0.1, sphere_index=3
         BvhNode {
-            aabb_min_left_start:  [0.1, 0.3, 0.1, f32::from_bits(3)],
-            aabb_max_right_count: [0.3, 0.5, 0.3, f32::from_bits(0)],
+            aabb_min_left_start:  [0.1-s3_radius, s3_centre-s3_radius, 0.1-s3_radius, f32::from_bits(3)],
+            aabb_max_right_count: [0.1+s3_radius, s3_centre+s3_radius, 0.1+s3_radius, f32::from_bits(0)],
+            node_type: NODE_LEAF_SPHERE,
+            _reserved: [0; 3],
+        },
+        // Node 4: BLAS leaf — glass sphere containg all the rest of the geometry
+        // containg the rest of the geometry
+        // at , radius, sphere_index=4
+        BvhNode {
+            aabb_min_left_start:  [0.0-s4_radius, s4_centre-s4_radius, 0.0-s4_radius, f32::from_bits(4)],
+            aabb_max_right_count: [0.0+s4_radius, s4_centre+s4_radius, 0.0+s4_radius, f32::from_bits(0)],
+            node_type: NODE_LEAF_SPHERE,
+            _reserved: [0; 3],
+        },
+        // Node 5: BLAS leaf — air bubble inside glass sphere
+        // at , radius , sphere_index=5
+        BvhNode {
+            aabb_min_left_start:  [0.0-s5_radius, s5_centre-s5_radius, 0.0-s5_radius, f32::from_bits(5)],
+            aabb_max_right_count: [0.0+s5_radius, s5_centre+s5_radius, 0.0+s5_radius, f32::from_bits(0)],
             node_type: NODE_LEAF_SPHERE,
             _reserved: [0; 3],
         },
@@ -170,38 +199,61 @@ pub fn build_trivial_scene() -> (Vec<BvhNode>, Vec<TlasInstance>, Vec<Sphere>) {
         0.0, 0.0, 0.0, 1.0_f32,
     ];
 
+    let two_thirds_scale = [
+        2.0/3.0, 0.0, 0.0, 0.0,
+        0.0, 2.0/3.0, 0.0, 0.0,
+        0.0, 0.0, 2.0/3.0, 0.0,
+        0.0, 0.0, 0.0, 1.0_f32,
+    ];
+
     let instances = vec![
         TlasInstance { transform: identity, blas_offset: 0, flags: 0, _reserved: [0; 2] },
         TlasInstance { transform: identity, blas_offset: 1, flags: 0, _reserved: [0; 2] },
         TlasInstance { transform: identity, blas_offset: 2, flags: 0, _reserved: [0; 2] },
         TlasInstance { transform: identity, blas_offset: 3, flags: 0, _reserved: [0; 2] },
+        TlasInstance { transform: identity, blas_offset: 4, flags: 0, _reserved: [0; 2] },
+        TlasInstance { transform: identity, blas_offset: 5, flags: 0, _reserved: [0; 2] },
     ];
 
     let spheres = vec![
         // Sphere 0: glass sphere
         Sphere {
-            center_radius:     [0.0, 0.5, 0.0, 0.5],
+            center_radius:     [0.0, -s012_radius, 0.0, s012_radius],
             front_material_id: 1,
             back_material_id:  1,
             _pad:              [0; 2],
         },
         // Sphere 1: diffuse sphere
         Sphere {
-            center_radius:     [0.6, -0.5, 0.0, 0.5],
+            center_radius:     [s012_radius+0.05, s12_centre, 0.0, s012_radius],
             front_material_id: 2,
             back_material_id:  2,
             _pad:              [0; 2],
         },
         // Sphere 2: metallic sphere
         Sphere {
-            center_radius:     [-0.6, -0.5, 0.0, 0.5],
+            center_radius:     [-s012_radius-0.05, s12_centre, 0.0, s012_radius],
             front_material_id: 3,
             back_material_id:  3,
             _pad:              [0; 2],
         },
-        // Sphere 2: air bubble inside glass sphere
+        // Sphere 3: air bubble inside glass sphere
         Sphere {
-            center_radius:     [0.2, 0.4, 0.2, 0.1],
+            center_radius:     [0.1, s3_centre, 0.1, s3_radius],
+            front_material_id: 4,
+            back_material_id:  4,
+            _pad:              [0; 2],
+        },
+        // Sphere 4: big glass sphere
+        Sphere {
+            center_radius:     [0.0, s4_centre, 0.0, s4_radius],
+            front_material_id: 1,
+            back_material_id:  1,
+            _pad:              [0; 2],
+        },
+        // Sphere 5: air bubble inside big glass sphere
+        Sphere {
+            center_radius:     [0.0, s5_centre, 0.0, s5_radius],
             front_material_id: 4,
             back_material_id:  4,
             _pad:              [0; 2],

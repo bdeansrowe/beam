@@ -87,7 +87,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // ── D2 — Push / pop medium stack (refracted paths only) ───────────────────
     if !is_reflect {
         if hit.face_forward == 1u {
-            if ray.medium_depth < 4u {
+            if ray.medium_depth < MEDIUM_STACK_DEPTH {
                 ray.medium_stack[ray.medium_depth] = MediumEntry(mat_id, mat.ior);
                 ray.medium_depth += 1u;
             }

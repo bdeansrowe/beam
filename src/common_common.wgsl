@@ -6,14 +6,17 @@ struct MediumEntry {
     ior:         f32,
 }  // 8 bytes
 
-// 80 bytes total. throughput uses array<f32,3> (align 4) not vec3<f32> (align 16)
-// so that medium_depth at offset 64 + 4 bytes + throughput 12 bytes = 80 exactly.
+// Must match MEDIUM_STACK_DEPTH in bvh.rs.
+const MEDIUM_STACK_DEPTH: u32 = 8u;
+
+// 112 bytes total. throughput uses array<f32,3> (align 4) not vec3<f32> (align 16)
+// so that medium_depth at offset 96 + 4 bytes + throughput 12 bytes = 112 exactly.
 struct Ray {
-    origin:       vec4<f32>,             // .w = tmin
-    direction:    vec4<f32>,             // .w = tmax
-    medium_stack: array<MediumEntry, 4>, // 32 bytes — entries 0..medium_depth-1 active
-    medium_depth: u32,                   // 1 = air only
-    throughput:   array<f32, 3>,         // path throughput RGB; (1,1,1) at ray birth
+    origin:       vec4<f32>,                                  // .w = tmin
+    direction:    vec4<f32>,                                  // .w = tmax
+    medium_stack: array<MediumEntry, MEDIUM_STACK_DEPTH>,     // 64 bytes — entries 0..medium_depth-1 active
+    medium_depth: u32,                                        // 1 = air only
+    throughput:   array<f32, 3>,                              // path throughput RGB; (1,1,1) at ray birth
 }
 
 struct HitRecord {
