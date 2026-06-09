@@ -120,6 +120,14 @@ fn sphere_hit(sph: Sphere, origin: vec3<f32>, dir: vec3<f32>, tmin: f32, tmax: f
     return -1.0;
 }
 
+struct PixelState {
+    accum:      vec4<f32>,  // offset  0
+    sq:         vec4<f32>,  // offset 16
+    variance:   f32,        // offset 32
+    bloom_slot: i32,        // offset 36
+    _pad:       vec2<f32>,  // offset 40 — pads to 48 bytes
+}  // 48 bytes
+
 struct LightUniform {
     position:  vec4<f32>,
     color:     vec4<f32>,

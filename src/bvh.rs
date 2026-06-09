@@ -48,6 +48,17 @@ pub struct Material {
 // 64 bytes total. Clean multiple of 16.
 // WGSL struct must mirror exactly — use vec4<f32> for [f32;4] fields.
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct PixelState {
+    pub accum:      [f32; 4],  // weighted color sum — 16 bytes
+    pub sq:         [f32; 4],  // sum of squares — 16 bytes
+    pub variance:   f32,       // cached variance — 4 bytes
+    pub bloom_slot: i32,       // -1 = not blooming, ≥0 = slot index — 4 bytes
+    pub _pad:       [f32; 2],  // alignment to 48 bytes — 8 bytes
+}
+// 48 bytes total.
+
 #[allow(dead_code)]
 pub const NODE_INTERNAL:      u32 = 0;
 #[allow(dead_code)]

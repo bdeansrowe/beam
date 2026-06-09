@@ -5,7 +5,7 @@ use std::rc::Rc;
 use wgpu::*;
 use winit::{dpi::PhysicalSize, window::Window};
 
-use crate::bvh::{build_trivial_scene, HitRecord, LightUniform, Material, MaterialType, Ray, Vertex, TriangleRecord};
+use crate::bvh::{build_trivial_scene, HitRecord, LightUniform, Material, MaterialType, PixelState, Ray, Vertex, TriangleRecord};
 
 // ── Camera uniform — mirrors WGSL `struct Camera` in ray_gen.wgsl ─────────────
 #[repr(C)]
@@ -113,9 +113,9 @@ pub struct GpuState {
     // Scratch buffer (B08 — one vec4<f32> per pixel)
     #[allow(dead_code)]
     scratch_buf:  Buffer,
-    // Accumulation buffer (B09 — persistent weighted sum across frames)
+    // Pixel state buffer (B12 — replaces accum_buf; carries PixelState per pixel)
     #[allow(dead_code)]
-    accum_buf:    Buffer,
+    pixel_buf:    Buffer,
     // Display texture — written by resolve pass, read by blit
     #[allow(dead_code)]
     display_tex:  Texture,
@@ -137,6 +137,17 @@ pub struct GpuState {
     accumulate_pipeline: ComputePipeline,
     accum_bg0:           BindGroup,
     accum_bg1:           BindGroup,
+
+    // Variance pass (B12 — per-pixel variance from sq/accum)
+    variance_pipeline: ComputePipeline,
+    variance_bg0:      BindGroup,
+    variance_bg1:      BindGroup,
+
+    // Selection pass (B12 — top-K bloom slot promotion)
+    bloom_counter_buf:  Buffer,
+    selection_pipeline: ComputePipeline,
+    selection_bg0:      BindGroup,
+    selection_bg1:      BindGroup,
 
     // Resolve: divide accum by frame count, write display_tex (B09)
     resolve_pipeline: ComputePipeline,
@@ -325,11 +336,24 @@ impl GpuState {
         let (roulette_pipeline, roulette_bg0, roulette_bg1) =
             Self::create_roulette_pass(&device, &frame_buf, &ray_buf).await;
 
-        let (accumulate_pipeline, accum_bg0, accum_bg1, accum_buf) =
+        let (accumulate_pipeline, accum_bg0, accum_bg1, pixel_buf) =
             Self::create_accumulate(&device, &frame_buf, &scratch_buf, size.width, size.height).await;
 
+        let bloom_counter_buf = device.create_buffer(&BufferDescriptor {
+            label:              Some("Bloom Counter"),
+            size:               4,
+            usage:              BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let (variance_pipeline, variance_bg0, variance_bg1) =
+            Self::create_variance_pass(&device, &frame_buf, &pixel_buf).await;
+
+        let (selection_pipeline, selection_bg0, selection_bg1) =
+            Self::create_selection_pass(&device, &frame_buf, &pixel_buf, &bloom_counter_buf).await;
+
         let (resolve_pipeline, resolve_bg0, resolve_bg1, display_tex, display_tex_view) =
-            Self::create_resolve(&device, &frame_buf, &accum_buf, &sky_mask_buf, size.width, size.height).await;
+            Self::create_resolve(&device, &frame_buf, &pixel_buf, &sky_mask_buf, size.width, size.height).await;
 
         let (blit_pipeline, blit_bg0) =
             Self::create_blit(&device, &config, &display_tex_view);
@@ -338,7 +362,7 @@ impl GpuState {
         let counter_ready    = Rc::new(RefCell::new(true));
 
         log::info!(
-            "B09 ready: {}×{} — additive accumulation, resolve pass",
+            "B12 ready: {}×{} — pixel_buf, additive accumulation, resolve pass",
             size.width, size.height,
         );
 
@@ -356,9 +380,11 @@ impl GpuState {
             shade_scene_bg0, shade_direct_bg0, shade_bg1_rw,
             clear_pipeline, clear_bg0, clear_bg1,
             roulette_pipeline, roulette_bg0, roulette_bg1,
-            scratch_buf, accum_buf, display_tex,
+            scratch_buf, pixel_buf, display_tex,
             intersect_pipeline, intersect_bg1, scene_bg0,
             accumulate_pipeline, accum_bg0, accum_bg1,
+            variance_pipeline, variance_bg0, variance_bg1,
+            bloom_counter_buf, selection_pipeline, selection_bg0, selection_bg1,
             resolve_pipeline, resolve_bg0, resolve_bg1,
             blit_pipeline, blit_bg0,
             frame: 0,
@@ -404,7 +430,8 @@ impl GpuState {
                 emission:      [0.0, 0.0, 0.0, 0.0],
                 absorption:    [0.0, 0.0, 0.0, 0.0],
                 material_type: MaterialType::Glass,
-                ior:           1.5,
+                ior:           1.3333333,
+                // ior:           1.5,
                 roughness:     0.0,
                 _pad:          0.0,
             },
@@ -1141,17 +1168,17 @@ impl GpuState {
         width:       u32,
         height:      u32,
     ) -> (ComputePipeline, BindGroup, BindGroup, Buffer) {
-        let accum_buf = device.create_buffer(&BufferDescriptor {
-            label:              Some("Accum Buffer"),
-            size:               (width * height) as u64 * 16u64,
+        let pixel_buf = device.create_buffer(&BufferDescriptor {
+            label:              Some("Pixel State Buffer"),
+            size:               (width * height) as u64 * std::mem::size_of::<PixelState>() as u64,
             usage:              BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: true,
         });
         {
-            let mut view = accum_buf.slice(..).get_mapped_range_mut();
+            let mut view = pixel_buf.slice(..).get_mapped_range_mut();
             view.fill(0u8);
         }
-        accum_buf.unmap();
+        pixel_buf.unmap();
 
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Accumulate BG0"),
@@ -1194,7 +1221,7 @@ impl GpuState {
             label: Some("Accumulate BG1"), layout: &bg1_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: scratch_buf.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: accum_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: pixel_buf.as_entire_binding() },
             ],
         });
 
@@ -1226,13 +1253,163 @@ impl GpuState {
             log::error!("Accumulate pipeline validation error: {:?}", err);
         }
 
-        (pipeline, accum_bg0, accum_bg1, accum_buf)
+        (pipeline, accum_bg0, accum_bg1, pixel_buf)
+    }
+
+    async fn create_variance_pass(
+        device:    &Device,
+        frame_buf: &Buffer,
+        pixel_buf: &Buffer,
+    ) -> (ComputePipeline, BindGroup, BindGroup) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Variance BG0"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Variance BG1"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let variance_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Variance BG0"), layout: &bg0_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() }],
+        });
+        let variance_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Variance BG1"), layout: &bg1_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: pixel_buf.as_entire_binding() }],
+        });
+
+        let src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("variance_pass.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Variance Pass"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
+        });
+        let info = shader.get_compilation_info().await;
+        for msg in &info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("variance_pass.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("variance_pass.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Variance Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Variance Pass"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Variance Pass pipeline validation error: {:?}", err);
+        }
+
+        (pipeline, variance_bg0, variance_bg1)
+    }
+
+    async fn create_selection_pass(
+        device:            &Device,
+        frame_buf:         &Buffer,
+        pixel_buf:         &Buffer,
+        bloom_counter_buf: &Buffer,
+    ) -> (ComputePipeline, BindGroup, BindGroup) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Selection BG0"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Selection BG1"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let selection_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Selection BG0"), layout: &bg0_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() }],
+        });
+        let selection_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Selection BG1"), layout: &bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: pixel_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: bloom_counter_buf.as_entire_binding() },
+            ],
+        });
+
+        let src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("selection_pass.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Selection Pass"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
+        });
+        let info = shader.get_compilation_info().await;
+        for msg in &info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("selection_pass.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("selection_pass.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Selection Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Selection Pass"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Selection Pass pipeline validation error: {:?}", err);
+        }
+
+        (pipeline, selection_bg0, selection_bg1)
     }
 
     async fn create_resolve(
         device:        &Device,
         frame_buf:     &Buffer,
-        accum_buf:     &Buffer,
+        pixel_buf:     &Buffer,
         sky_mask_buf:  &Buffer,
         width:         u32,
         height:        u32,
@@ -1298,7 +1475,7 @@ impl GpuState {
         let resolve_bg1 = device.create_bind_group(&BindGroupDescriptor {
             label: Some("Resolve BG1"), layout: &bg1_layout,
             entries: &[
-                BindGroupEntry { binding: 0, resource: accum_buf.as_entire_binding() },
+                BindGroupEntry { binding: 0, resource: pixel_buf.as_entire_binding() },
                 BindGroupEntry { binding: 1, resource: BindingResource::TextureView(&display_tex_view) },
                 BindGroupEntry { binding: 2, resource: sky_mask_buf.as_entire_binding() },
             ],
@@ -1810,7 +1987,7 @@ impl GpuState {
             self.queue.submit([enc.finish()]);
         }
 
-        // ── Post-loop: accumulate + resolve + blit ────────────────────────────
+        // ── Post-loop: accumulate + variance + resolve + blit ─────────────────
         {
             let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("Post-Loop Encoder"),
@@ -1824,6 +2001,38 @@ impl GpuState {
                 cpass.set_bind_group(1, &self.accum_bg1, &[]);
                 cpass.dispatch_workgroups(wx, wy, 1);
             }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Variance Pass"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.variance_pipeline);
+                cpass.set_bind_group(0, &self.variance_bg0, &[]);
+                cpass.set_bind_group(1, &self.variance_bg1, &[]);
+                cpass.dispatch_workgroups(wx, wy, 1);
+            }
+            self.queue.submit([enc.finish()]);
+        }
+        // Reset bloom counter before selection so slot indices start from 0 each frame.
+        self.queue.write_buffer(&self.bloom_counter_buf, 0, bytemuck::bytes_of(&0u32));
+        {
+            let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Selection Encoder"),
+            });
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Selection Pass"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.selection_pipeline);
+                cpass.set_bind_group(0, &self.selection_bg0, &[]);
+                cpass.set_bind_group(1, &self.selection_bg1, &[]);
+                cpass.dispatch_workgroups(wx, wy, 1);
+            }
+            self.queue.submit([enc.finish()]);
+        }
+        {
+            let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Resolve Encoder"),
+            });
             {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
                     label: Some("Resolve"), timestamp_writes: None,
