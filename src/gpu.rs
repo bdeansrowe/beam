@@ -8,6 +8,8 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::bvh::{build_trivial_scene, HitRecord, LightUniform, Material, MaterialType, PixelState, Ray, Vertex, TriangleRecord};
 
+const BLOOM_AMPLIFICATION: u32 = 256;
+
 // ── Camera uniform — mirrors WGSL `struct Camera` in ray_gen.wgsl ─────────────
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -154,6 +156,12 @@ pub struct GpuState {
     // Bloom hit buffer (B14 — separate hit records for bloom bounce loop)
     #[allow(dead_code)]
     bloom_hit_buf:          Buffer,
+    // Bloom index buffer (B14 — slot → pixel reverse mapping)
+    #[allow(dead_code)]
+    bloom_index_buf:        Buffer,
+    // Bloom scratch buffer (B14 — flat ray-result storage, slot × 256 × vec4<f32>)
+    #[allow(dead_code)]
+    bloom_scratch_buf:      Buffer,
 
     // Bloom bounce pipelines (B14)
     bloom_intersect_pipeline: ComputePipeline,
@@ -172,6 +180,11 @@ pub struct GpuState {
     selection_bg0:      BindGroup,
     selection_bg1:      BindGroup,
 
+    // Bloom postshader (B14 — collapse 256 rays/slot into scratch_buf)
+    bloom_postshader_pipeline: ComputePipeline,
+    bloom_postshader_bg0:      BindGroup,
+    bloom_postshader_bg1:      BindGroup,
+
     // Resolve: divide accum by frame count, write display_tex (B09)
     resolve_pipeline: ComputePipeline,
     resolve_bg0:      BindGroup,
@@ -182,6 +195,7 @@ pub struct GpuState {
     blit_bg0:      BindGroup,
 
     frame: u32,
+    bloom_slot_capacity: u32,
 
     // Ray counter (HUD Mrays/frame)
     ray_counter_buf:         Buffer,
@@ -207,6 +221,7 @@ impl GpuState {
         };
 
         log::info!("GpuState::new — canvas size: {}×{}", size.width, size.height);
+        let bloom_slot_capacity = (size.width * size.height) / BLOOM_AMPLIFICATION;
 
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::BROWSER_WEBGPU,
@@ -371,14 +386,28 @@ impl GpuState {
 
         let bloom_slot_buf = device.create_buffer(&BufferDescriptor {
             label:              Some("Bloom Slot Buffer"),
-            size:               4096u64 * 256u64 * std::mem::size_of::<Ray>() as u64,
+            size:               bloom_slot_capacity as u64 * BLOOM_AMPLIFICATION as u64 * std::mem::size_of::<Ray>() as u64,
             usage:              BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
         let bloom_hit_buf = device.create_buffer(&BufferDescriptor {
             label:              Some("Bloom Hit Buffer"),
-            size:               4096u64 * 256u64 * std::mem::size_of::<HitRecord>() as u64,
+            size:               bloom_slot_capacity as u64 * BLOOM_AMPLIFICATION as u64 * std::mem::size_of::<HitRecord>() as u64,
+            usage:              BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let bloom_index_buf = device.create_buffer(&BufferDescriptor {
+            label:              Some("Bloom Index Buffer"),
+            size:               bloom_slot_capacity as u64 * 4,
+            usage:              BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let bloom_scratch_buf = device.create_buffer(&BufferDescriptor {
+            label:              Some("Bloom Scratch Buffer"),
+            size:               bloom_slot_capacity as u64 * BLOOM_AMPLIFICATION as u64 * 16,
             usage:              BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -388,7 +417,7 @@ impl GpuState {
              bloom_glass_pipeline, bloom_direct_pipeline,
              bloom_intersect_bg1, bloom_shade_bg1, bloom_roulette_bg1) =
             Self::create_bloom_bounce_pipelines(
-                &device, &bloom_slot_buf, &bloom_hit_buf, &scratch_buf, &ray_counter_buf,
+                &device, &bloom_slot_buf, &bloom_hit_buf, &bloom_scratch_buf, &ray_counter_buf,
             ).await;
 
         let (bloom_ray_gen_pipeline, bloom_ray_gen_bg0, bloom_ray_gen_bg1) =
@@ -396,11 +425,16 @@ impl GpuState {
                 &device, &camera_buf, &frame_buf, &pixel_buf, &bloom_slot_buf,
             ).await;
 
+        let (bloom_postshader_pipeline, bloom_postshader_bg0, bloom_postshader_bg1) =
+            Self::create_bloom_postshader(
+                &device, &frame_buf, &bloom_index_buf, &bloom_scratch_buf, &scratch_buf,
+            ).await;
+
         let (variance_pipeline, variance_bg0, variance_bg1) =
             Self::create_variance_pass(&device, &frame_buf, &pixel_buf).await;
 
         let (selection_pipeline, selection_bg0, selection_bg1) =
-            Self::create_selection_pass(&device, &frame_buf, &pixel_buf, &bloom_counter_buf).await;
+            Self::create_selection_pass(&device, &frame_buf, &pixel_buf, &bloom_counter_buf, &bloom_index_buf).await;
 
         let (resolve_pipeline, resolve_bg0, resolve_bg1, display_tex, display_tex_view) =
             Self::create_resolve(&device, &frame_buf, &pixel_buf, &sky_mask_buf, size.width, size.height).await;
@@ -412,7 +446,7 @@ impl GpuState {
         let counter_ready    = Rc::new(RefCell::new(true));
 
         log::info!(
-            "B14 ready: {}×{} — bloom bounce loop, variant mixin refactor, ray.seed",
+            "B14 ready: {}×{} — bloom_postshader, bloom_index_buf, bloom_scratch_buf",
             size.width, size.height,
         );
 
@@ -439,11 +473,13 @@ impl GpuState {
             bloom_glass_pipeline, bloom_direct_pipeline,
             bloom_intersect_bg1, bloom_shade_bg1, bloom_roulette_bg1,
             bloom_ray_gen_pipeline, bloom_ray_gen_bg0, bloom_ray_gen_bg1,
-            bloom_slot_buf, bloom_hit_buf,
+            bloom_slot_buf, bloom_hit_buf, bloom_index_buf, bloom_scratch_buf,
             bloom_counter_buf, selection_pipeline, selection_bg0, selection_bg1,
+            bloom_postshader_pipeline, bloom_postshader_bg0, bloom_postshader_bg1,
             resolve_pipeline, resolve_bg0, resolve_bg1,
             blit_pipeline, blit_bg0,
             frame: 0,
+            bloom_slot_capacity,
             ray_counter_buf, ray_counter_staging_buf,
             last_mrays_frame, counter_ready,
         })
@@ -1387,6 +1423,7 @@ impl GpuState {
         frame_buf:         &Buffer,
         pixel_buf:         &Buffer,
         bloom_counter_buf: &Buffer,
+        bloom_index_buf:   &Buffer,
     ) -> (ComputePipeline, BindGroup, BindGroup) {
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Selection BG0"),
@@ -1418,6 +1455,14 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 2, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -1430,6 +1475,7 @@ impl GpuState {
             entries: &[
                 BindGroupEntry { binding: 0, resource: pixel_buf.as_entire_binding() },
                 BindGroupEntry { binding: 1, resource: bloom_counter_buf.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: bloom_index_buf.as_entire_binding() },
             ],
         });
 
@@ -1984,11 +2030,11 @@ impl GpuState {
     }
 
     async fn create_bloom_bounce_pipelines(
-        device:          &Device,
-        bloom_slot_buf:  &Buffer,
-        bloom_hit_buf:   &Buffer,
-        scratch_buf:     &Buffer,
-        ray_counter_buf: &Buffer,
+        device:            &Device,
+        bloom_slot_buf:    &Buffer,
+        bloom_hit_buf:     &Buffer,
+        bloom_scratch_buf: &Buffer,
+        ray_counter_buf:   &Buffer,
     ) -> (ComputePipeline, ComputePipeline, ComputePipeline, ComputePipeline,
           ComputePipeline, ComputePipeline,
           BindGroup, BindGroup, BindGroup) {
@@ -2067,7 +2113,7 @@ impl GpuState {
             label: Some("Bloom Shade BG1"), layout: &bloom_shade_bg1_layout,
             entries: &[
                 BindGroupEntry { binding: 0, resource: bloom_hit_buf.as_entire_binding() },
-                BindGroupEntry { binding: 1, resource: scratch_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: bloom_scratch_buf.as_entire_binding() },
                 BindGroupEntry { binding: 2, resource: bloom_slot_buf.as_entire_binding() },
             ],
         });
@@ -2268,6 +2314,98 @@ impl GpuState {
          bloom_intersect_bg1, bloom_shade_bg1, bloom_roulette_bg1)
     }
 
+    async fn create_bloom_postshader(
+        device:            &Device,
+        frame_buf:         &Buffer,
+        bloom_index_buf:   &Buffer,
+        bloom_scratch_buf: &Buffer,
+        scratch_buf:       &Buffer,
+    ) -> (ComputePipeline, BindGroup, BindGroup) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Postshader BG0"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Postshader BG1"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let bloom_postshader_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Bloom Postshader BG0"), layout: &bg0_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: frame_buf.as_entire_binding() }],
+        });
+        let bloom_postshader_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Bloom Postshader BG1"), layout: &bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: bloom_index_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: bloom_scratch_buf.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: scratch_buf.as_entire_binding() },
+            ],
+        });
+
+        let src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("bloom_postshader.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Bloom Postshader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
+        });
+        let info = shader.get_compilation_info().await;
+        for msg in &info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("bloom_postshader.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("bloom_postshader.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Bloom Postshader Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Bloom Postshader"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Bloom Postshader pipeline validation error: {:?}", err);
+        }
+
+        (pipeline, bloom_postshader_bg0, bloom_postshader_bg1)
+    }
+
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
@@ -2439,6 +2577,7 @@ impl GpuState {
         }
 
         // ── Bloom bounce loop: 8 bounces through bloom_slot_buf ──────────────
+        let bsc = self.bloom_slot_capacity;
         for bounce in 0u32..8u32 {
             self.queue.write_buffer(
                 &self.frame_buf, 0,
@@ -2458,7 +2597,7 @@ impl GpuState {
                 cpass.set_pipeline(&self.bloom_intersect_pipeline);
                 cpass.set_bind_group(0, &self.scene_bg0, &[]);
                 cpass.set_bind_group(1, &self.bloom_intersect_bg1, &[]);
-                cpass.dispatch_workgroups(4096, 1, 1);
+                cpass.dispatch_workgroups(bsc, 1, 1);
             }
             {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
@@ -2467,7 +2606,7 @@ impl GpuState {
                 cpass.set_pipeline(&self.bloom_diffuse_pipeline);
                 cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
                 cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
-                cpass.dispatch_workgroups(4096, 1, 1);
+                cpass.dispatch_workgroups(bsc, 1, 1);
             }
             {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
@@ -2476,7 +2615,7 @@ impl GpuState {
                 cpass.set_pipeline(&self.bloom_metallic_pipeline);
                 cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
                 cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
-                cpass.dispatch_workgroups(4096, 1, 1);
+                cpass.dispatch_workgroups(bsc, 1, 1);
             }
             {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
@@ -2485,7 +2624,7 @@ impl GpuState {
                 cpass.set_pipeline(&self.bloom_glass_pipeline);
                 cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
                 cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
-                cpass.dispatch_workgroups(4096, 1, 1);
+                cpass.dispatch_workgroups(bsc, 1, 1);
             }
             {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
@@ -2494,7 +2633,7 @@ impl GpuState {
                 cpass.set_pipeline(&self.bloom_roulette_pipeline);
                 cpass.set_bind_group(0, &self.roulette_bg0, &[]);
                 cpass.set_bind_group(1, &self.bloom_roulette_bg1, &[]);
-                cpass.dispatch_workgroups(4096, 1, 1);
+                cpass.dispatch_workgroups(bsc, 1, 1);
             }
             {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
@@ -2503,7 +2642,24 @@ impl GpuState {
                 cpass.set_pipeline(&self.bloom_direct_pipeline);
                 cpass.set_bind_group(0, &self.shade_direct_bg0, &[]);
                 cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
-                cpass.dispatch_workgroups(4096, 1, 1);
+                cpass.dispatch_workgroups(bsc, 1, 1);
+            }
+            self.queue.submit([enc.finish()]);
+        }
+
+        // ── Bloom postshader: collapse 256 rays/slot into scratch_buf ────────
+        {
+            let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Bloom Postshader Encoder"),
+            });
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Bloom Postshader"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bloom_postshader_pipeline);
+                cpass.set_bind_group(0, &self.bloom_postshader_bg0, &[]);
+                cpass.set_bind_group(1, &self.bloom_postshader_bg1, &[]);
+                cpass.dispatch_workgroups(bsc, 1, 1);
             }
             self.queue.submit([enc.finish()]);
         }

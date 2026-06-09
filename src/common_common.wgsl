@@ -144,6 +144,9 @@ struct FrameUniform {
     bounce: u32,
 }  // 16 bytes
 
+const BLOOM_AMPLIFICATION: u32 = 256u;   // bloom rays per pixel
+const BLOOM_SLOT_CAPACITY: u32 = 1875u; // must match bloom_slot_capacity() in gpu.rs — no codegen yet
+
 const FIBONACCI_HASH: u32 = 0x9e3779b9u;  // 2^32 / phi — Knuth Vol. 3
 
 fn pcg_hash(v: u32) -> u32 {
