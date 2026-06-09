@@ -3,8 +3,8 @@
 // No-op for bounce < 3. From bounce 3 onward: probabilistic termination based
 // on max(throughput.rgb). Survivors are importance-reweighted by 1/survival.
 
-@group(0) @binding(0) var<uniform>       frame_data: FrameUniform;
-@group(1) @binding(0) var<storage, read_write> rays: array<Ray>;
+@group(0) @binding(0) var<uniform> frame_data: FrameUniform;
+// rays declared in roulette_variant_*.wgsl
 
 const HASH_MUL_0_R: u32 = 0xbf324c81u;
 const HASH_MUL_1_R: u32 = 0x68b31f7eu;
@@ -19,11 +19,7 @@ fn hash_r(x: u32) -> u32 {
     return v;
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.y * frame_data.dim_x + gid.x;
-    if gid.x >= frame_data.dim_x || gid.y >= frame_data.dim_y { return; }
-
+fn roulette_main(idx: u32) {
     // Skip already-terminated rays.
     if rays[idx].direction.w < 0.0 { return; }
 

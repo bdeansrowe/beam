@@ -13,11 +13,13 @@ pub struct MediumEntry {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct Ray {
-    pub origin:       [f32; 4],                          // 16 bytes
-    pub direction:    [f32; 4],                          // 16 bytes
-    pub medium_stack: [MediumEntry; MEDIUM_STACK_DEPTH], // 64 bytes
-    pub medium_depth: u32,                               // 4 bytes
-    pub throughput:   [f32; 3],                          // 12 bytes → 112 bytes total; path throughput (RGB)
+    pub origin:       [f32; 4],                          // offset   0 — 16 bytes
+    pub direction:    [f32; 4],                          // offset  16 — 16 bytes
+    pub medium_stack: [MediumEntry; MEDIUM_STACK_DEPTH], // offset  32 — 64 bytes
+    pub medium_depth: u32,                               // offset  96 —  4 bytes
+    pub throughput:   [f32; 3],                          // offset 100 — 12 bytes
+    pub seed:         u32,                               // offset 112 —  4 bytes
+    pub _pad:         [u32; 3],                          // offset 116 — 12 bytes → 128 bytes total
 }
 
 #[repr(u32)]

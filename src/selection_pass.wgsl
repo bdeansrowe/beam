@@ -3,7 +3,8 @@
 // common_common.wgsl prepended at pipeline creation.
 
 const BLOOM_K:         u32 = 4096u;
-const BLOOM_THRESHOLD: f32 = 0.001;
+const BLOOM_THRESHOLD: f32 = 0.2;
+//const BLOOM_THRESHOLD: f32 = 0.001;
 
 @group(0) @binding(0) var<uniform>             frame_data:    FrameUniform;
 @group(1) @binding(0) var<storage, read_write> pixel_buf:     array<PixelState>;

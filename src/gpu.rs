@@ -3,6 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wgpu::*;
+use wgpu::util::DeviceExt;
 use winit::{dpi::PhysicalSize, window::Window};
 
 use crate::bvh::{build_trivial_scene, HitRecord, LightUniform, Material, MaterialType, PixelState, Ray, Vertex, TriangleRecord};
@@ -142,6 +143,28 @@ pub struct GpuState {
     variance_pipeline: ComputePipeline,
     variance_bg0:      BindGroup,
     variance_bg1:      BindGroup,
+
+    // Bloom ray generation (B13)
+    bloom_ray_gen_pipeline: ComputePipeline,
+    bloom_ray_gen_bg0:      BindGroup,
+    bloom_ray_gen_bg1:      BindGroup,
+    // Bloom ray buffer (B13 — K=4096 slots × 256 rays × sizeof(Ray) bytes/ray)
+    #[allow(dead_code)]
+    bloom_slot_buf:         Buffer,
+    // Bloom hit buffer (B14 — separate hit records for bloom bounce loop)
+    #[allow(dead_code)]
+    bloom_hit_buf:          Buffer,
+
+    // Bloom bounce pipelines (B14)
+    bloom_intersect_pipeline: ComputePipeline,
+    bloom_roulette_pipeline:  ComputePipeline,
+    bloom_diffuse_pipeline:   ComputePipeline,
+    bloom_metallic_pipeline:  ComputePipeline,
+    bloom_glass_pipeline:     ComputePipeline,
+    bloom_direct_pipeline:    ComputePipeline,
+    bloom_intersect_bg1:      BindGroup,
+    bloom_shade_bg1:          BindGroup,
+    bloom_roulette_bg1:       BindGroup,
 
     // Selection pass (B12 — top-K bloom slot promotion)
     bloom_counter_buf:  Buffer,
@@ -346,6 +369,33 @@ impl GpuState {
             mapped_at_creation: false,
         });
 
+        let bloom_slot_buf = device.create_buffer(&BufferDescriptor {
+            label:              Some("Bloom Slot Buffer"),
+            size:               4096u64 * 256u64 * std::mem::size_of::<Ray>() as u64,
+            usage:              BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let bloom_hit_buf = device.create_buffer(&BufferDescriptor {
+            label:              Some("Bloom Hit Buffer"),
+            size:               4096u64 * 256u64 * std::mem::size_of::<HitRecord>() as u64,
+            usage:              BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let (bloom_intersect_pipeline, bloom_roulette_pipeline,
+             bloom_diffuse_pipeline, bloom_metallic_pipeline,
+             bloom_glass_pipeline, bloom_direct_pipeline,
+             bloom_intersect_bg1, bloom_shade_bg1, bloom_roulette_bg1) =
+            Self::create_bloom_bounce_pipelines(
+                &device, &bloom_slot_buf, &bloom_hit_buf, &scratch_buf, &ray_counter_buf,
+            ).await;
+
+        let (bloom_ray_gen_pipeline, bloom_ray_gen_bg0, bloom_ray_gen_bg1) =
+            Self::create_bloom_ray_gen(
+                &device, &camera_buf, &frame_buf, &pixel_buf, &bloom_slot_buf,
+            ).await;
+
         let (variance_pipeline, variance_bg0, variance_bg1) =
             Self::create_variance_pass(&device, &frame_buf, &pixel_buf).await;
 
@@ -362,7 +412,7 @@ impl GpuState {
         let counter_ready    = Rc::new(RefCell::new(true));
 
         log::info!(
-            "B12 ready: {}×{} — pixel_buf, additive accumulation, resolve pass",
+            "B14 ready: {}×{} — bloom bounce loop, variant mixin refactor, ray.seed",
             size.width, size.height,
         );
 
@@ -384,6 +434,12 @@ impl GpuState {
             intersect_pipeline, intersect_bg1, scene_bg0,
             accumulate_pipeline, accum_bg0, accum_bg1,
             variance_pipeline, variance_bg0, variance_bg1,
+            bloom_intersect_pipeline, bloom_roulette_pipeline,
+            bloom_diffuse_pipeline, bloom_metallic_pipeline,
+            bloom_glass_pipeline, bloom_direct_pipeline,
+            bloom_intersect_bg1, bloom_shade_bg1, bloom_roulette_bg1,
+            bloom_ray_gen_pipeline, bloom_ray_gen_bg0, bloom_ray_gen_bg1,
+            bloom_slot_buf, bloom_hit_buf,
             bloom_counter_buf, selection_pipeline, selection_bg0, selection_bg1,
             resolve_pipeline, resolve_bg0, resolve_bg1,
             blit_pipeline, blit_bg0,
@@ -960,7 +1016,7 @@ impl GpuState {
             label: Some("Roulette BG1"), layout: &bg1_layout,
             entries: &[BindGroupEntry { binding: 0, resource: ray_buf.as_entire_binding() }],
         });
-        let src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("roulette_pass.wgsl"));
+        let src = format!("{}\n{}\n{}", include_str!("common_common.wgsl"), include_str!("roulette_variant_canvas.wgsl"), include_str!("roulette_pass.wgsl"));
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label:  Some("Roulette Pass"),
             source: ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
@@ -1126,7 +1182,7 @@ impl GpuState {
             ],
         });
 
-        let intersect_src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("intersect.wgsl"));
+        let intersect_src = format!("{}\n{}\n{}\n{}", include_str!("common_common.wgsl"), include_str!("intersect_common.wgsl"), include_str!("intersect_variant_canvas.wgsl"), include_str!("intersect.wgsl"));
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label:  Some("Intersect"),
             source: ShaderSource::Wgsl(std::borrow::Cow::Owned(intersect_src)),
@@ -1168,17 +1224,19 @@ impl GpuState {
         width:       u32,
         height:      u32,
     ) -> (ComputePipeline, BindGroup, BindGroup, Buffer) {
-        let pixel_buf = device.create_buffer(&BufferDescriptor {
-            label:              Some("Pixel State Buffer"),
-            size:               (width * height) as u64 * std::mem::size_of::<PixelState>() as u64,
-            usage:              BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+        let n = (width * height) as usize;
+        let init_pixels: Vec<PixelState> = (0..n).map(|_| PixelState {
+            accum:      [0.0; 4],
+            sq:         [0.0; 4],
+            variance:   0.0,
+            bloom_slot: -1,
+            _pad:       [0.0; 2],
+        }).collect();
+        let pixel_buf = device.create_buffer_init(&util::BufferInitDescriptor {
+            label:    Some("Pixel State Buffer"),
+            contents: bytemuck::cast_slice(&init_pixels),
+            usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
-        {
-            let mut view = pixel_buf.slice(..).get_mapped_range_mut();
-            view.fill(0u8);
-        }
-        pixel_buf.unmap();
 
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Accumulate BG0"),
@@ -1563,6 +1621,102 @@ impl GpuState {
         (pipeline, blit_bg0)
     }
 
+    async fn create_bloom_ray_gen(
+        device:        &Device,
+        camera_buf:    &Buffer,
+        frame_buf:     &Buffer,
+        pixel_buf:     &Buffer,
+        bloom_slot_buf: &Buffer,
+    ) -> (ComputePipeline, BindGroup, BindGroup) {
+        let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Ray Gen BG0"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Ray Gen BG1"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let bloom_ray_gen_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Bloom Ray Gen BG0"), layout: &bg0_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: frame_buf.as_entire_binding() },
+            ],
+        });
+        let bloom_ray_gen_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Bloom Ray Gen BG1"), layout: &bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: pixel_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: bloom_slot_buf.as_entire_binding() },
+            ],
+        });
+
+        let src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("bloom_ray_gen.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Bloom Ray Gen"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
+        });
+        let info = shader.get_compilation_info().await;
+        for msg in &info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("bloom_ray_gen.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("bloom_ray_gen.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Bloom Ray Gen Layout"),
+            bind_group_layouts: &[&bg0_layout, &bg1_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Bloom Ray Gen"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Bloom Ray Gen pipeline validation error: {:?}", err);
+        }
+
+        (pipeline, bloom_ray_gen_bg0, bloom_ray_gen_bg1)
+    }
+
     async fn create_shade_pipelines(
         device:            &Device,
         ray_buf:           &Buffer,
@@ -1671,18 +1825,21 @@ impl GpuState {
             ],
         });
 
-        // Compose common_common.wgsl + shade_common.wgsl + mesh_common.wgsl + shade_<variant>.wgsl
-        // mesh_common.wgsl declares bindings 3/4 (vertex_buf, geometry_buf) — omitted from shade_direct.
-        let common_common = include_str!("common_common.wgsl");
-        let shade_common  = include_str!("shade_common.wgsl");
-        let mesh_common   = include_str!("mesh_common.wgsl");
-        let diffuse       = include_str!("shade_diffuse.wgsl");
-        let metallic      = include_str!("shade_metallic.wgsl");
-        let glass         = include_str!("shade_glass.wgsl");
+        // Compose common_common + shade_common + mesh_common + <variant_canvas> + shade_<material>
+        let common_common    = include_str!("common_common.wgsl");
+        let shade_common     = include_str!("shade_common.wgsl");
+        let mesh_common      = include_str!("mesh_common.wgsl");
+        let canvas_diffuse   = include_str!("shade_diffuse_variant_canvas.wgsl");
+        let canvas_metallic  = include_str!("shade_metallic_variant_canvas.wgsl");
+        let canvas_glass     = include_str!("shade_glass_variant_canvas.wgsl");
+        let canvas_direct    = include_str!("shade_direct_variant_canvas.wgsl");
+        let diffuse          = include_str!("shade_diffuse.wgsl");
+        let metallic         = include_str!("shade_metallic.wgsl");
+        let glass            = include_str!("shade_glass.wgsl");
 
-        let diffuse_src  = format!("{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, diffuse);
-        let metallic_src = format!("{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, metallic);
-        let glass_src    = format!("{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, glass);
+        let diffuse_src  = format!("{}\n{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, canvas_diffuse,  diffuse);
+        let metallic_src = format!("{}\n{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, canvas_metallic, metallic);
+        let glass_src    = format!("{}\n{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, canvas_glass,    glass);
 
         let diffuse_module = device.create_shader_module(ShaderModuleDescriptor {
             label:  Some("Shade Diffuse"),
@@ -1793,7 +1950,7 @@ impl GpuState {
             ],
         });
 
-        let direct_src = format!("{}\n{}\n{}", common_common, shade_common, include_str!("shade_direct.wgsl"));
+        let direct_src = format!("{}\n{}\n{}\n{}\n{}", common_common, shade_common, mesh_common, canvas_direct, include_str!("shade_direct.wgsl"));
         let direct_module = device.create_shader_module(ShaderModuleDescriptor {
             label:  Some("Shade Direct"),
             source: ShaderSource::Wgsl(std::borrow::Cow::Owned(direct_src)),
@@ -1824,6 +1981,291 @@ impl GpuState {
         (shade_diffuse_pipeline, shade_metallic_pipeline, shade_glass_pipeline,
          shade_direct_pipeline,
          shade_scene_bg0, shade_direct_bg0, shade_bg1_rw)
+    }
+
+    async fn create_bloom_bounce_pipelines(
+        device:          &Device,
+        bloom_slot_buf:  &Buffer,
+        bloom_hit_buf:   &Buffer,
+        scratch_buf:     &Buffer,
+        ray_counter_buf: &Buffer,
+    ) -> (ComputePipeline, ComputePipeline, ComputePipeline, ComputePipeline,
+          ComputePipeline, ComputePipeline,
+          BindGroup, BindGroup, BindGroup) {
+        let storage_ro = |binding: u32| BindGroupLayoutEntry {
+            binding, visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false, min_binding_size: None,
+            },
+            count: None,
+        };
+        let storage_rw = |binding: u32| BindGroupLayoutEntry {
+            binding, visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false, min_binding_size: None,
+            },
+            count: None,
+        };
+        let uniform_b = |binding: u32| BindGroupLayoutEntry {
+            binding, visibility: ShaderStages::COMPUTE,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false, min_binding_size: None,
+            },
+            count: None,
+        };
+
+        // ── BG0 layouts — re-created to match mainline layouts ──────────────
+        let intersect_bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Intersect BG0"),
+            entries: &[
+                storage_ro(0), storage_ro(1), storage_ro(2),
+                storage_ro(3), storage_ro(4), storage_ro(5),
+                uniform_b(7),
+            ],
+        });
+        let shade_bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Shade BG0"),
+            entries: &[
+                storage_ro(2), storage_ro(3), storage_ro(4),
+                storage_ro(5), storage_ro(6), uniform_b(7),
+            ],
+        });
+        let shade_direct_bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Direct BG0"),
+            entries: &[
+                storage_ro(0), storage_ro(1), storage_ro(2),
+                storage_ro(5), storage_ro(6), uniform_b(7),
+            ],
+        });
+        let roulette_bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Roulette BG0"),
+            entries: &[uniform_b(0)],
+        });
+
+        // ── Bloom BG1 layouts and bind groups ────────────────────────────────
+        let bloom_intersect_bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Intersect BG1"),
+            entries: &[storage_rw(0), storage_rw(2), storage_rw(3)],
+        });
+        let bloom_intersect_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Bloom Intersect BG1"), layout: &bloom_intersect_bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: bloom_slot_buf.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: bloom_hit_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: ray_counter_buf.as_entire_binding() },
+            ],
+        });
+
+        let bloom_shade_bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Shade BG1"),
+            entries: &[storage_ro(0), storage_rw(1), storage_rw(2)],
+        });
+        let bloom_shade_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Bloom Shade BG1"), layout: &bloom_shade_bg1_layout,
+            entries: &[
+                BindGroupEntry { binding: 0, resource: bloom_hit_buf.as_entire_binding() },
+                BindGroupEntry { binding: 1, resource: scratch_buf.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: bloom_slot_buf.as_entire_binding() },
+            ],
+        });
+
+        let bloom_roulette_bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Roulette BG1"),
+            entries: &[storage_rw(0)],
+        });
+        let bloom_roulette_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Bloom Roulette BG1"), layout: &bloom_roulette_bg1_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: bloom_slot_buf.as_entire_binding() }],
+        });
+
+        // ── Pipeline layouts ─────────────────────────────────────────────────
+        let bloom_intersect_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Bloom Intersect Layout"),
+            bind_group_layouts: &[&intersect_bg0_layout, &bloom_intersect_bg1_layout],
+            push_constant_ranges: &[],
+        });
+        let bloom_shade_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Bloom Shade Layout"),
+            bind_group_layouts: &[&shade_bg0_layout, &bloom_shade_bg1_layout],
+            push_constant_ranges: &[],
+        });
+        let bloom_direct_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Bloom Direct Layout"),
+            bind_group_layouts: &[&shade_direct_bg0_layout, &bloom_shade_bg1_layout],
+            push_constant_ranges: &[],
+        });
+        let bloom_roulette_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Bloom Roulette Layout"),
+            bind_group_layouts: &[&roulette_bg0_layout, &bloom_roulette_bg1_layout],
+            push_constant_ranges: &[],
+        });
+
+        // ── Shader source composition ─────────────────────────────────────────
+        let common_common  = include_str!("common_common.wgsl");
+        let shade_common   = include_str!("shade_common.wgsl");
+        let mesh_common    = include_str!("mesh_common.wgsl");
+
+        let intersect_src = format!("{}\n{}\n{}\n{}",
+            common_common,
+            include_str!("intersect_common.wgsl"),
+            include_str!("intersect_variant_bloom.wgsl"),
+            include_str!("intersect.wgsl"));
+        let roulette_src = format!("{}\n{}\n{}",
+            common_common,
+            include_str!("roulette_variant_bloom.wgsl"),
+            include_str!("roulette_pass.wgsl"));
+        let diffuse_src = format!("{}\n{}\n{}\n{}\n{}",
+            common_common, shade_common, mesh_common,
+            include_str!("shade_diffuse_variant_bloom.wgsl"),
+            include_str!("shade_diffuse.wgsl"));
+        let metallic_src = format!("{}\n{}\n{}\n{}\n{}",
+            common_common, shade_common, mesh_common,
+            include_str!("shade_metallic_variant_bloom.wgsl"),
+            include_str!("shade_metallic.wgsl"));
+        let glass_src = format!("{}\n{}\n{}\n{}\n{}",
+            common_common, shade_common, mesh_common,
+            include_str!("shade_glass_variant_bloom.wgsl"),
+            include_str!("shade_glass.wgsl"));
+        let direct_src = format!("{}\n{}\n{}\n{}\n{}",
+            common_common, shade_common, mesh_common,
+            include_str!("shade_direct_variant_bloom.wgsl"),
+            include_str!("shade_direct.wgsl"));
+
+        // ── Shader modules ────────────────────────────────────────────────────
+        let intersect_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Bloom Intersect"), source: ShaderSource::Wgsl(std::borrow::Cow::Owned(intersect_src)),
+        });
+        for msg in &intersect_module.get_compilation_info().await.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("bloom_intersect: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("bloom_intersect: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let roulette_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Bloom Roulette"), source: ShaderSource::Wgsl(std::borrow::Cow::Owned(roulette_src)),
+        });
+        for msg in &roulette_module.get_compilation_info().await.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("bloom_roulette: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("bloom_roulette: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let diffuse_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Bloom Diffuse"), source: ShaderSource::Wgsl(std::borrow::Cow::Owned(diffuse_src)),
+        });
+        for msg in &diffuse_module.get_compilation_info().await.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("bloom_diffuse: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("bloom_diffuse: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let metallic_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Bloom Metallic"), source: ShaderSource::Wgsl(std::borrow::Cow::Owned(metallic_src)),
+        });
+        for msg in &metallic_module.get_compilation_info().await.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("bloom_metallic: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("bloom_metallic: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let glass_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Bloom Glass"), source: ShaderSource::Wgsl(std::borrow::Cow::Owned(glass_src)),
+        });
+        for msg in &glass_module.get_compilation_info().await.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("bloom_glass: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("bloom_glass: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        let direct_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Bloom Direct"), source: ShaderSource::Wgsl(std::borrow::Cow::Owned(direct_src)),
+        });
+        for msg in &direct_module.get_compilation_info().await.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("bloom_direct: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("bloom_direct: {}",  msg.message),
+                _ => {}
+            }
+        }
+
+        // ── Pipelines ─────────────────────────────────────────────────────────
+        device.push_error_scope(ErrorFilter::Validation);
+        let bloom_intersect_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Bloom Intersect"), layout: Some(&bloom_intersect_layout),
+            module: &intersect_module, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Bloom Intersect pipeline error: {:?}", err);
+        }
+
+        device.push_error_scope(ErrorFilter::Validation);
+        let bloom_roulette_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Bloom Roulette"), layout: Some(&bloom_roulette_layout),
+            module: &roulette_module, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Bloom Roulette pipeline error: {:?}", err);
+        }
+
+        device.push_error_scope(ErrorFilter::Validation);
+        let bloom_diffuse_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Bloom Diffuse"), layout: Some(&bloom_shade_layout),
+            module: &diffuse_module, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Bloom Diffuse pipeline error: {:?}", err);
+        }
+
+        device.push_error_scope(ErrorFilter::Validation);
+        let bloom_metallic_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Bloom Metallic"), layout: Some(&bloom_shade_layout),
+            module: &metallic_module, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Bloom Metallic pipeline error: {:?}", err);
+        }
+
+        device.push_error_scope(ErrorFilter::Validation);
+        let bloom_glass_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Bloom Glass"), layout: Some(&bloom_shade_layout),
+            module: &glass_module, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Bloom Glass pipeline error: {:?}", err);
+        }
+
+        device.push_error_scope(ErrorFilter::Validation);
+        let bloom_direct_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Bloom Direct"), layout: Some(&bloom_direct_layout),
+            module: &direct_module, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Bloom Direct pipeline error: {:?}", err);
+        }
+
+        (bloom_intersect_pipeline, bloom_roulette_pipeline,
+         bloom_diffuse_pipeline, bloom_metallic_pipeline,
+         bloom_glass_pipeline, bloom_direct_pipeline,
+         bloom_intersect_bg1, bloom_shade_bg1, bloom_roulette_bg1)
     }
 
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -1905,6 +2347,15 @@ impl GpuState {
                 cpass.set_bind_group(1, &self.ray_gen_bg1, &[]);
                 cpass.dispatch_workgroups(wx, wy, 1);
             }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Bloom Ray Gen"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bloom_ray_gen_pipeline);
+                cpass.set_bind_group(0, &self.bloom_ray_gen_bg0, &[]);
+                cpass.set_bind_group(1, &self.bloom_ray_gen_bg1, &[]);
+                cpass.dispatch_workgroups(wx, wy, 1);
+            }
             self.queue.submit([enc.finish()]);
         }
 
@@ -1983,6 +2434,76 @@ impl GpuState {
                 cpass.set_bind_group(0, &self.shade_direct_bg0, &[]);
                 cpass.set_bind_group(1, &self.shade_bg1_rw, &[]);
                 cpass.dispatch_workgroups(wx, wy, 1);
+            }
+            self.queue.submit([enc.finish()]);
+        }
+
+        // ── Bloom bounce loop: 8 bounces through bloom_slot_buf ──────────────
+        for bounce in 0u32..8u32 {
+            self.queue.write_buffer(
+                &self.frame_buf, 0,
+                bytemuck::bytes_of(&FrameUniform {
+                    frame:  self.frame,
+                    dims:   [self.size.width, self.size.height],
+                    bounce,
+                }),
+            );
+            let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Bloom Bounce Encoder"),
+            });
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Bloom Intersect"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bloom_intersect_pipeline);
+                cpass.set_bind_group(0, &self.scene_bg0, &[]);
+                cpass.set_bind_group(1, &self.bloom_intersect_bg1, &[]);
+                cpass.dispatch_workgroups(4096, 1, 1);
+            }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Bloom Shade Diffuse"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bloom_diffuse_pipeline);
+                cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
+                cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
+                cpass.dispatch_workgroups(4096, 1, 1);
+            }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Bloom Shade Metallic"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bloom_metallic_pipeline);
+                cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
+                cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
+                cpass.dispatch_workgroups(4096, 1, 1);
+            }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Bloom Shade Glass"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bloom_glass_pipeline);
+                cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
+                cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
+                cpass.dispatch_workgroups(4096, 1, 1);
+            }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Bloom Roulette"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bloom_roulette_pipeline);
+                cpass.set_bind_group(0, &self.roulette_bg0, &[]);
+                cpass.set_bind_group(1, &self.bloom_roulette_bg1, &[]);
+                cpass.dispatch_workgroups(4096, 1, 1);
+            }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Bloom Shade Direct"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bloom_direct_pipeline);
+                cpass.set_bind_group(0, &self.shade_direct_bg0, &[]);
+                cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
+                cpass.dispatch_workgroups(4096, 1, 1);
             }
             self.queue.submit([enc.finish()]);
         }

@@ -52,16 +52,15 @@ fn hash_u32(x: u32) -> u32 {
     return v;
 }
 
-// ── pixel_seed ────────────────────────────────────────────────────────────────
-// Canonical per-pixel RNG seed. Hashes px and py independently to break
-// the spatial correlation that arises from seeding on a linear pixel index.
-// All shading kernels must use this function rather than constructing seeds
-// from idx directly.
-fn pixel_seed(px: u32, py: u32) -> u32 {
-    let spatial = pcg_hash(px) ^ (pcg_hash(py) * FIBONACCI_HASH);
-    return spatial
-         ^ pcg_hash(frame_data.frame << 16u)
-         ^ pcg_hash(frame_data.bounce * FIBONACCI_HASH);
+
+// ── Schlick Fresnel approximation (glass BSDF) ────────────────────────────────
+const HASH_FLOAT_MASK: u32 = 0x00ffffffu;
+const HASH_FLOAT_DIV:  f32 = 16777216.0; // 2^24
+
+fn schlick(cos_theta: f32, n1: f32, n2: f32) -> f32 {
+    let t  = (n1 - n2) / (n1 + n2);
+    let r0 = t * t;
+    return r0 + (1.0 - r0) * pow(1.0 - cos_theta, 5.0);
 }
 
 fn cosine_weighted_hemisphere(normal: vec3<f32>, seed: u32) -> vec3<f32> {

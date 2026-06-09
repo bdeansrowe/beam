@@ -2,28 +2,9 @@
 // Composed with shade_common.wgsl at pipeline creation: shade_common is prepended,
 // so all structs, bindings, and utility functions are already in scope here.
 
-@group(1) @binding(2) var<storage, read_write> rays: array<Ray>;
+// rays declared in shade_glass_variant_*.wgsl
 
-// Low 24 bits of hash output — float precision ceiling for
-// uniform [0,1) conversion.
-const HASH_FLOAT_MASK: u32 = 0x00ffffffu;
-const HASH_FLOAT_DIV:  f32 = 16777216.0; // 2^24
-
-// ── Schlick Fresnel approximation ─────────────────────────────────────────────
-// r0 computed via multiplication to avoid pow() with a potentially negative base.
-fn schlick(cos_theta: f32, n1: f32, n2: f32) -> f32 {
-    let t  = (n1 - n2) / (n1 + n2);
-    let r0 = t * t;
-    return r0 + (1.0 - r0) * pow(1.0 - cos_theta, 5.0);
-}
-
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let px = gid.x;
-    let py = gid.y;
-    if px >= frame_data.dim_x || py >= frame_data.dim_y { return; }
-
-    let idx = py * frame_data.dim_x + px;
+fn glass_main(idx: u32) {
     let hit = hit_records[idx];
 
     // Skip misses and non-glass hits.
@@ -71,7 +52,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else {
         // ── D3 — Schlick Fresnel + Russian roulette ────────────────────────────
         let F    = schlick(cos_theta, n1, n2);
-        let seed = pixel_seed(px, py);
+        var seed = rays[idx].seed;
         let rand = f32(hash_u32(seed) & HASH_FLOAT_MASK) / HASH_FLOAT_DIV;
         if rand < F {
             out_dir    = reflect(ray.direction.xyz, normal);
@@ -111,5 +92,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ray.throughput[0] *= color.r;
     ray.throughput[1] *= color.g;
     ray.throughput[2] *= color.b;
-    rays[idx]         = ray;
+    ray.seed           = pcg_hash(ray.seed ^ (frame_data.bounce * FIBONACCI_HASH));
+    rays[idx]          = ray;
 }

@@ -2,15 +2,9 @@
 // Writes specular reflection continuation ray; multiplies path throughput by base_color.
 // Composed with shade_common.wgsl at pipeline creation.
 
-@group(1) @binding(2) var<storage, read_write> rays: array<Ray>;
+// rays declared in shade_metallic_variant_*.wgsl
 
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let px = gid.x;
-    let py = gid.y;
-    if px >= frame_data.dim_x || py >= frame_data.dim_y { return; }
-
-    let idx = py * frame_data.dim_x + px;
+fn metallic_main(idx: u32) {
     let hit = hit_records[idx];
 
     if hit.t >= F32_MAX { return; }

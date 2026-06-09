@@ -3,15 +3,9 @@
 // NEE (shade_direct) owns direct lighting — no scratch_buf write here.
 // Composed with shade_common.wgsl at pipeline creation.
 
-@group(1) @binding(2) var<storage, read_write> rays: array<Ray>;
+// rays declared in shade_diffuse_variant_*.wgsl
 
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let px = gid.x;
-    let py = gid.y;
-    if px >= frame_data.dim_x || py >= frame_data.dim_y { return; }
-
-    let idx = py * frame_data.dim_x + px;
+fn diffuse_main(idx: u32) {
     let hit = hit_records[idx];
 
     if hit.t >= F32_MAX { return; }
@@ -25,7 +19,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let normal  = interpolate_normal(hit, ray);
     let hit_pos = hit_position(ray, hit.t);
 
-    let seed    = pixel_seed(px, py);
+    var seed    = rays[idx].seed;
     let new_dir = cosine_weighted_hemisphere(normal, seed);
 
     ray.origin        = vec4<f32>(offset_ray_origin(hit_pos, normal), ray.origin.w);
@@ -33,5 +27,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ray.throughput[0] *= mat.base_color.r;
     ray.throughput[1] *= mat.base_color.g;
     ray.throughput[2] *= mat.base_color.b;
+    ray.seed  = pcg_hash(seed ^ (frame_data.bounce * FIBONACCI_HASH));
     rays[idx] = ray;
 }
