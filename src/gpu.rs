@@ -180,6 +180,10 @@ pub struct GpuState {
     selection_bg0:      BindGroup,
     selection_bg1:      BindGroup,
 
+    // Bloom scratch clear (B14c — zero bloom_scratch_buf each frame before bloom bounce loop)
+    clear_bloom_scratch_pipeline: ComputePipeline,
+    clear_bloom_scratch_bg1:      BindGroup,
+
     // Bloom postshader (B14 — collapse 256 rays/slot into scratch_buf)
     bloom_postshader_pipeline: ComputePipeline,
     bloom_postshader_bg0:      BindGroup,
@@ -412,6 +416,9 @@ impl GpuState {
             mapped_at_creation: false,
         });
 
+        let (clear_bloom_scratch_pipeline, clear_bloom_scratch_bg1) =
+            Self::create_clear_bloom_scratch(&device, &bloom_scratch_buf).await;
+
         let (bloom_intersect_pipeline, bloom_roulette_pipeline,
              bloom_diffuse_pipeline, bloom_metallic_pipeline,
              bloom_glass_pipeline, bloom_direct_pipeline,
@@ -427,7 +434,7 @@ impl GpuState {
 
         let (bloom_postshader_pipeline, bloom_postshader_bg0, bloom_postshader_bg1) =
             Self::create_bloom_postshader(
-                &device, &frame_buf, &bloom_index_buf, &bloom_scratch_buf, &scratch_buf,
+                &device, &frame_buf, &bloom_index_buf, &bloom_scratch_buf, &scratch_buf, &pixel_buf,
             ).await;
 
         let (variance_pipeline, variance_bg0, variance_bg1) =
@@ -446,7 +453,7 @@ impl GpuState {
         let counter_ready    = Rc::new(RefCell::new(true));
 
         log::info!(
-            "B14 ready: {}×{} — bloom_postshader, bloom_index_buf, bloom_scratch_buf",
+            "B14d ready: {}×{} — bloom_postshader occupancy guard",
             size.width, size.height,
         );
 
@@ -475,6 +482,7 @@ impl GpuState {
             bloom_ray_gen_pipeline, bloom_ray_gen_bg0, bloom_ray_gen_bg1,
             bloom_slot_buf, bloom_hit_buf, bloom_index_buf, bloom_scratch_buf,
             bloom_counter_buf, selection_pipeline, selection_bg0, selection_bg1,
+            clear_bloom_scratch_pipeline, clear_bloom_scratch_bg1,
             bloom_postshader_pipeline, bloom_postshader_bg0, bloom_postshader_bg1,
             resolve_pipeline, resolve_bg0, resolve_bg1,
             blit_pipeline, blit_bg0,
@@ -1015,6 +1023,54 @@ impl GpuState {
             log::error!("Clear Pass pipeline validation error: {:?}", err);
         }
         (pipeline, clear_bg0, clear_bg1)
+    }
+
+    async fn create_clear_bloom_scratch(
+        device:          &Device,
+        bloom_scratch_buf: &Buffer,
+    ) -> (ComputePipeline, BindGroup) {
+        let bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Clear Bloom Scratch BG1"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0, visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false, min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let clear_bloom_scratch_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Clear Bloom Scratch BG1"), layout: &bg1_layout,
+            entries: &[BindGroupEntry { binding: 0, resource: bloom_scratch_buf.as_entire_binding() }],
+        });
+        let src = format!("{}\n{}", include_str!("common_common.wgsl"), include_str!("clear_bloom_scratch.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label:  Some("Clear Bloom Scratch"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Owned(src)),
+        });
+        let shader_info = shader.get_compilation_info().await;
+        for msg in &shader_info.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("clear_bloom_scratch.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("clear_bloom_scratch.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Clear Bloom Scratch Layout"),
+            bind_group_layouts: &[&bg1_layout],
+            push_constant_ranges: &[],
+        });
+        device.push_error_scope(ErrorFilter::Validation);
+        let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Clear Bloom Scratch"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Clear Bloom Scratch pipeline validation error: {:?}", err);
+        }
+        (pipeline, clear_bloom_scratch_bg1)
     }
 
     async fn create_roulette_pass(
@@ -2320,6 +2376,7 @@ impl GpuState {
         bloom_index_buf:   &Buffer,
         bloom_scratch_buf: &Buffer,
         scratch_buf:       &Buffer,
+        pixel_buf:         &Buffer,
     ) -> (ComputePipeline, BindGroup, BindGroup) {
         let bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Bloom Postshader BG0"),
@@ -2359,6 +2416,14 @@ impl GpuState {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 3, visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false, min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -2372,6 +2437,7 @@ impl GpuState {
                 BindGroupEntry { binding: 0, resource: bloom_index_buf.as_entire_binding() },
                 BindGroupEntry { binding: 1, resource: bloom_scratch_buf.as_entire_binding() },
                 BindGroupEntry { binding: 2, resource: scratch_buf.as_entire_binding() },
+                BindGroupEntry { binding: 3, resource: pixel_buf.as_entire_binding() },
             ],
         });
 
@@ -2466,6 +2532,14 @@ impl GpuState {
                 cpass.set_bind_group(0, &self.clear_bg0, &[]);
                 cpass.set_bind_group(1, &self.clear_bg1, &[]);
                 cpass.dispatch_workgroups(wx, wy, 1);
+            }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Clear Bloom Scratch"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.clear_bloom_scratch_pipeline);
+                cpass.set_bind_group(0, &self.clear_bloom_scratch_bg1, &[]);
+                cpass.dispatch_workgroups(self.bloom_slot_capacity, 1, 1);
             }
             if self.frame == 0 {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {

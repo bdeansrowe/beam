@@ -7,6 +7,7 @@
 @group(1) @binding(0) var<storage, read>       bloom_index_buf:   array<u32>;
 @group(1) @binding(1) var<storage, read>       bloom_scratch_buf: array<vec4<f32>>;
 @group(1) @binding(2) var<storage, read_write> scratch_buf:       array<vec4<f32>>;
+@group(1) @binding(3) var<storage, read>       pixel_buf:         array<PixelState>;
 
 var<workgroup> wg_accum: array<vec4<f32>, 256>;
 
@@ -34,6 +35,7 @@ fn main(
     }
 
     if sample_i == 0u {
+        if pixel_buf[pixel_idx].bloom_slot != i32(slot) { return; }
         scratch_buf[pixel_idx] = wg_accum[0] / f32(BLOOM_AMPLIFICATION);
     }
 }
