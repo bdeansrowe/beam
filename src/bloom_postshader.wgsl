@@ -24,7 +24,7 @@ fn main(
     workgroupBarrier();
 
     // Parallel reduction — sum 256 values
-    var stride = 128u;
+    var stride = BLOOM_AMPLIFICATION / 2u;
     loop {
         if stride == 0u { break; }
         if sample_i < stride {

@@ -163,16 +163,15 @@ pub struct GpuState {
     #[allow(dead_code)]
     bloom_scratch_buf:      Buffer,
 
-    // Bloom bounce pipelines (B14)
-    bloom_intersect_pipeline: ComputePipeline,
-    bloom_roulette_pipeline:  ComputePipeline,
-    bloom_diffuse_pipeline:   ComputePipeline,
-    bloom_metallic_pipeline:  ComputePipeline,
-    bloom_glass_pipeline:     ComputePipeline,
-    bloom_direct_pipeline:    ComputePipeline,
-    bloom_intersect_bg1:      BindGroup,
-    bloom_shade_bg1:          BindGroup,
-    bloom_roulette_bg1:       BindGroup,
+    // Bloom bounce pipelines (B14/B15)
+    bloom_intersect_pipeline:   ComputePipeline,
+    bloom_diffuse_pipeline:     ComputePipeline,
+    bloom_metallic_pipeline:    ComputePipeline,
+    bloom_glass_pipeline:       ComputePipeline,
+    bloom_direct_pipeline:      ComputePipeline,
+    bloom_background_pipeline:  ComputePipeline,
+    bloom_intersect_bg1:        BindGroup,
+    bloom_shade_bg1:            BindGroup,
 
     // Selection pass (B12 — top-K bloom slot promotion)
     bloom_counter_buf:  Buffer,
@@ -206,6 +205,11 @@ pub struct GpuState {
     ray_counter_staging_buf: Rc<Buffer>,
     last_mrays_frame:        Rc<RefCell<f32>>,
     counter_ready:           Rc<RefCell<bool>>,
+
+    // Bloom counter (HUD bloom occupancy)
+    bloom_counter_staging_buf: Rc<Buffer>,
+    last_bloom_occupancy:      Rc<RefCell<u32>>,
+    bloom_counter_ready:       Rc<RefCell<bool>>,
 }
 
 impl GpuState {
@@ -225,7 +229,8 @@ impl GpuState {
         };
 
         log::info!("GpuState::new — canvas size: {}×{}", size.width, size.height);
-        let bloom_slot_capacity = (size.width * size.height) / BLOOM_AMPLIFICATION;
+        let bloom_slot_capacity = 2048;
+        // let bloom_slot_capacity = (size.width * size.height) / BLOOM_AMPLIFICATION;
 
         let instance = Instance::new(&InstanceDescriptor {
             backends: Backends::BROWSER_WEBGPU,
@@ -384,7 +389,7 @@ impl GpuState {
         let bloom_counter_buf = device.create_buffer(&BufferDescriptor {
             label:              Some("Bloom Counter"),
             size:               4,
-            usage:              BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            usage:              BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -419,10 +424,11 @@ impl GpuState {
         let (clear_bloom_scratch_pipeline, clear_bloom_scratch_bg1) =
             Self::create_clear_bloom_scratch(&device, &bloom_scratch_buf).await;
 
-        let (bloom_intersect_pipeline, bloom_roulette_pipeline,
+        let (bloom_intersect_pipeline,
              bloom_diffuse_pipeline, bloom_metallic_pipeline,
              bloom_glass_pipeline, bloom_direct_pipeline,
-             bloom_intersect_bg1, bloom_shade_bg1, bloom_roulette_bg1) =
+             bloom_background_pipeline,
+             bloom_intersect_bg1, bloom_shade_bg1) =
             Self::create_bloom_bounce_pipelines(
                 &device, &bloom_slot_buf, &bloom_hit_buf, &bloom_scratch_buf, &ray_counter_buf,
             ).await;
@@ -452,8 +458,17 @@ impl GpuState {
         let last_mrays_frame = Rc::new(RefCell::new(0.0f32));
         let counter_ready    = Rc::new(RefCell::new(true));
 
+        let bloom_counter_staging_buf = Rc::new(device.create_buffer(&BufferDescriptor {
+            label:              Some("Bloom Counter Staging"),
+            size:               4,
+            usage:              BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+        let last_bloom_occupancy = Rc::new(RefCell::new(0u32));
+        let bloom_counter_ready  = Rc::new(RefCell::new(true));
+
         log::info!(
-            "B14d ready: {}×{} — bloom_postshader occupancy guard",
+            "B15f ready: {}×{} — bloom roulette removed",
             size.width, size.height,
         );
 
@@ -475,10 +490,11 @@ impl GpuState {
             intersect_pipeline, intersect_bg1, scene_bg0,
             accumulate_pipeline, accum_bg0, accum_bg1,
             variance_pipeline, variance_bg0, variance_bg1,
-            bloom_intersect_pipeline, bloom_roulette_pipeline,
+            bloom_intersect_pipeline,
             bloom_diffuse_pipeline, bloom_metallic_pipeline,
             bloom_glass_pipeline, bloom_direct_pipeline,
-            bloom_intersect_bg1, bloom_shade_bg1, bloom_roulette_bg1,
+            bloom_background_pipeline,
+            bloom_intersect_bg1, bloom_shade_bg1,
             bloom_ray_gen_pipeline, bloom_ray_gen_bg0, bloom_ray_gen_bg1,
             bloom_slot_buf, bloom_hit_buf, bloom_index_buf, bloom_scratch_buf,
             bloom_counter_buf, selection_pipeline, selection_bg0, selection_bg1,
@@ -490,6 +506,7 @@ impl GpuState {
             bloom_slot_capacity,
             ray_counter_buf, ray_counter_staging_buf,
             last_mrays_frame, counter_ready,
+            bloom_counter_staging_buf, last_bloom_occupancy, bloom_counter_ready,
         })
     }
 
@@ -2091,9 +2108,9 @@ impl GpuState {
         bloom_hit_buf:     &Buffer,
         bloom_scratch_buf: &Buffer,
         ray_counter_buf:   &Buffer,
-    ) -> (ComputePipeline, ComputePipeline, ComputePipeline, ComputePipeline,
-          ComputePipeline, ComputePipeline,
-          BindGroup, BindGroup, BindGroup) {
+    ) -> (ComputePipeline, ComputePipeline, ComputePipeline,
+          ComputePipeline, ComputePipeline, ComputePipeline,
+          BindGroup, BindGroup) {
         let storage_ro = |binding: u32| BindGroupLayoutEntry {
             binding, visibility: ShaderStages::COMPUTE,
             ty: BindingType::Buffer {
@@ -2142,11 +2159,6 @@ impl GpuState {
                 storage_ro(5), storage_ro(6), uniform_b(7),
             ],
         });
-        let roulette_bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label:   Some("Bloom Roulette BG0"),
-            entries: &[uniform_b(0)],
-        });
-
         // ── Bloom BG1 layouts and bind groups ────────────────────────────────
         let bloom_intersect_bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label:   Some("Bloom Intersect BG1"),
@@ -2174,15 +2186,6 @@ impl GpuState {
             ],
         });
 
-        let bloom_roulette_bg1_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label:   Some("Bloom Roulette BG1"),
-            entries: &[storage_rw(0)],
-        });
-        let bloom_roulette_bg1 = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("Bloom Roulette BG1"), layout: &bloom_roulette_bg1_layout,
-            entries: &[BindGroupEntry { binding: 0, resource: bloom_slot_buf.as_entire_binding() }],
-        });
-
         // ── Pipeline layouts ─────────────────────────────────────────────────
         let bloom_intersect_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("Bloom Intersect Layout"),
@@ -2199,9 +2202,13 @@ impl GpuState {
             bind_group_layouts: &[&shade_direct_bg0_layout, &bloom_shade_bg1_layout],
             push_constant_ranges: &[],
         });
-        let bloom_roulette_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("Bloom Roulette Layout"),
-            bind_group_layouts: &[&roulette_bg0_layout, &bloom_roulette_bg1_layout],
+        let bloom_background_bg0_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label:   Some("Bloom Background BG0"),
+            entries: &[uniform_b(0)],
+        });
+        let bloom_background_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Bloom Background Layout"),
+            bind_group_layouts: &[&bloom_background_bg0_layout, &bloom_shade_bg1_layout],
             push_constant_ranges: &[],
         });
 
@@ -2215,10 +2222,6 @@ impl GpuState {
             include_str!("intersect_common.wgsl"),
             include_str!("intersect_variant_bloom.wgsl"),
             include_str!("intersect.wgsl"));
-        let roulette_src = format!("{}\n{}\n{}",
-            common_common,
-            include_str!("roulette_variant_bloom.wgsl"),
-            include_str!("roulette_pass.wgsl"));
         let diffuse_src = format!("{}\n{}\n{}\n{}\n{}",
             common_common, shade_common, mesh_common,
             include_str!("shade_diffuse_variant_bloom.wgsl"),
@@ -2235,6 +2238,9 @@ impl GpuState {
             common_common, shade_common, mesh_common,
             include_str!("shade_direct_variant_bloom.wgsl"),
             include_str!("shade_direct.wgsl"));
+        let bloom_background_src = format!("{}\n{}",
+            common_common,
+            include_str!("background_shader_variant_bloom.wgsl"));
 
         // ── Shader modules ────────────────────────────────────────────────────
         let intersect_module = device.create_shader_module(ShaderModuleDescriptor {
@@ -2244,17 +2250,6 @@ impl GpuState {
             match msg.message_type {
                 CompilationMessageType::Error   => log::error!("bloom_intersect: {}", msg.message),
                 CompilationMessageType::Warning => log::warn!("bloom_intersect: {}",  msg.message),
-                _ => {}
-            }
-        }
-
-        let roulette_module = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("Bloom Roulette"), source: ShaderSource::Wgsl(std::borrow::Cow::Owned(roulette_src)),
-        });
-        for msg in &roulette_module.get_compilation_info().await.messages {
-            match msg.message_type {
-                CompilationMessageType::Error   => log::error!("bloom_roulette: {}", msg.message),
-                CompilationMessageType::Warning => log::warn!("bloom_roulette: {}",  msg.message),
                 _ => {}
             }
         }
@@ -2303,6 +2298,17 @@ impl GpuState {
             }
         }
 
+        let bloom_background_module = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Bloom Background"), source: ShaderSource::Wgsl(std::borrow::Cow::Owned(bloom_background_src)),
+        });
+        for msg in &bloom_background_module.get_compilation_info().await.messages {
+            match msg.message_type {
+                CompilationMessageType::Error   => log::error!("background_shader_variant_bloom.wgsl: {}", msg.message),
+                CompilationMessageType::Warning => log::warn!("background_shader_variant_bloom.wgsl: {}",  msg.message),
+                _ => {}
+            }
+        }
+
         // ── Pipelines ─────────────────────────────────────────────────────────
         device.push_error_scope(ErrorFilter::Validation);
         let bloom_intersect_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
@@ -2312,16 +2318,6 @@ impl GpuState {
         });
         if let Some(err) = device.pop_error_scope().await {
             log::error!("Bloom Intersect pipeline error: {:?}", err);
-        }
-
-        device.push_error_scope(ErrorFilter::Validation);
-        let bloom_roulette_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: Some("Bloom Roulette"), layout: Some(&bloom_roulette_layout),
-            module: &roulette_module, entry_point: Some("main"),
-            compilation_options: Default::default(), cache: None,
-        });
-        if let Some(err) = device.pop_error_scope().await {
-            log::error!("Bloom Roulette pipeline error: {:?}", err);
         }
 
         device.push_error_scope(ErrorFilter::Validation);
@@ -2364,10 +2360,21 @@ impl GpuState {
             log::error!("Bloom Direct pipeline error: {:?}", err);
         }
 
-        (bloom_intersect_pipeline, bloom_roulette_pipeline,
+        device.push_error_scope(ErrorFilter::Validation);
+        let bloom_background_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Bloom Background"), layout: Some(&bloom_background_layout),
+            module: &bloom_background_module, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None,
+        });
+        if let Some(err) = device.pop_error_scope().await {
+            log::error!("Bloom Background pipeline error: {:?}", err);
+        }
+
+        (bloom_intersect_pipeline,
          bloom_diffuse_pipeline, bloom_metallic_pipeline,
          bloom_glass_pipeline, bloom_direct_pipeline,
-         bloom_intersect_bg1, bloom_shade_bg1, bloom_roulette_bg1)
+         bloom_background_pipeline,
+         bloom_intersect_bg1, bloom_shade_bg1)
     }
 
     async fn create_bloom_postshader(
@@ -2675,6 +2682,15 @@ impl GpuState {
             }
             {
                 let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Bloom Background Shader"), timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.bloom_background_pipeline);
+                cpass.set_bind_group(0, &self.background_shader_bg0, &[]);
+                cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
+                cpass.dispatch_workgroups(bsc, 1, 1);
+            }
+            {
+                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
                     label: Some("Bloom Shade Diffuse"), timestamp_writes: None,
                 });
                 cpass.set_pipeline(&self.bloom_diffuse_pipeline);
@@ -2698,15 +2714,6 @@ impl GpuState {
                 cpass.set_pipeline(&self.bloom_glass_pipeline);
                 cpass.set_bind_group(0, &self.shade_scene_bg0, &[]);
                 cpass.set_bind_group(1, &self.bloom_shade_bg1, &[]);
-                cpass.dispatch_workgroups(bsc, 1, 1);
-            }
-            {
-                let mut cpass = enc.begin_compute_pass(&ComputePassDescriptor {
-                    label: Some("Bloom Roulette"), timestamp_writes: None,
-                });
-                cpass.set_pipeline(&self.bloom_roulette_pipeline);
-                cpass.set_bind_group(0, &self.roulette_bg0, &[]);
-                cpass.set_bind_group(1, &self.bloom_roulette_bg1, &[]);
                 cpass.dispatch_workgroups(bsc, 1, 1);
             }
             {
@@ -2779,6 +2786,34 @@ impl GpuState {
                 cpass.dispatch_workgroups(wx, wy, 1);
             }
             self.queue.submit([enc.finish()]);
+        }
+        // Copy bloom_counter_buf to staging and read back asynchronously.
+        // Skipped if the previous frame's map hasn't completed yet.
+        if *self.bloom_counter_ready.borrow() {
+            *self.bloom_counter_ready.borrow_mut() = false;
+            let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("Bloom Counter Readback"),
+            });
+            enc.copy_buffer_to_buffer(
+                &self.bloom_counter_buf, 0,
+                &*self.bloom_counter_staging_buf, 0,
+                4,
+            );
+            self.queue.submit([enc.finish()]);
+
+            let staging   = Rc::clone(&self.bloom_counter_staging_buf);
+            let occupancy = Rc::clone(&self.last_bloom_occupancy);
+            let ready     = Rc::clone(&self.bloom_counter_ready);
+            self.bloom_counter_staging_buf.slice(..).map_async(MapMode::Read, move |result| {
+                if result.is_ok() {
+                    let view  = staging.slice(..).get_mapped_range();
+                    let count = u32::from_le_bytes([view[0], view[1], view[2], view[3]]);
+                    drop(view);
+                    staging.unmap();
+                    *occupancy.borrow_mut() = count;
+                }
+                *ready.borrow_mut() = true;
+            });
         }
         {
             let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
@@ -2857,6 +2892,16 @@ impl GpuState {
                 window.as_ref(),
                 &wasm_bindgen::JsValue::from_str("beamMrays"),
                 &wasm_bindgen::JsValue::from_f64(*self.last_mrays_frame.borrow() as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                window.as_ref(),
+                &wasm_bindgen::JsValue::from_str("beamBloomOccupancy"),
+                &wasm_bindgen::JsValue::from_f64(*self.last_bloom_occupancy.borrow() as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                window.as_ref(),
+                &wasm_bindgen::JsValue::from_str("beamBloomSlotCapacity"),
+                &wasm_bindgen::JsValue::from_f64(self.bloom_slot_capacity as f64),
             );
         }
 

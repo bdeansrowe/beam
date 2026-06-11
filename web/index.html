@@ -36,14 +36,17 @@
       if (++tick % 10 === 0) {
         const fps    = 1000 / smoothMs;
         const mraysS = (canvas.width * canvas.height * fps) / 1e6;
-        const frame  = window.beamFrame != null ? window.beamFrame : '—';
-        const mraysF = window.beamMrays != null ? window.beamMrays.toFixed(2) : '—';
+        const frame    = window.beamFrame != null ? window.beamFrame : '—';
+        const mraysF   = window.beamMrays != null ? window.beamMrays.toFixed(2) : '—';
+        const bloomOcc = window.beamBloomOccupancy != null ? window.beamBloomOccupancy : '—';
+        const bloomCap = window.beamBloomSlotCapacity != null ? window.beamBloomSlotCapacity : '?';
         perf.textContent =
           `   FPS  ${fps.toFixed(1)}\n` +
           `    ms  ${smoothMs.toFixed(1)}\n` +
           `Mrays/s  ${mraysS.toFixed(2)}\n` +
           ` frame  ${frame}\n` +
-          `Mrays/f  ${mraysF}`;
+          `Mrays/f  ${mraysF}\n` +
+          ` bloom  ${bloomOcc} / ${bloomCap}`;
       }
       requestAnimationFrame(loop);
     }

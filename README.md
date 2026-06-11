@@ -7,8 +7,9 @@ A WebGPU wavefront path-tracer built in Rust/WASM.
 ## Current state
 
 Full multi-bounce wavefront path tracer rendering six analytic spheres
-with indirect illumination, glass refraction, and NEE direct lighting.
-8 bounces per frame; progressive accumulation across frames.
+with indirect illumination, glass refraction, NEE direct lighting, and
+per-pixel bloom convergence acceleration.
+8 bounces per frame; progressive temporal accumulation.
 
 1. **Ray generation** — pinhole camera, `FrameUniform`-seeded jitter;
    rays written to GPU storage buffer; throughput initialized to
@@ -41,22 +42,47 @@ with indirect illumination, glass refraction, and NEE direct lighting.
    average into `scratch_buf` — sky pixels are never re-dispatched
    in subsequent frames.
 
-3. **Accumulate** — accumulates `scratch_buf` (sum of all bounce
+3. **Bloom bounce loop (×8)** — runs immediately after the mainline
+   loop on the active bloom slot set. Each slot represents one
+   high-variance pixel promoted by the selection pass; 256 independent
+   rays per slot trace the same scene with distinct Halton sub-pixel
+   jitter and PCG-seeded paths. The per-bounce dispatches mirror the
+   mainline loop: BVH traversal → background shader variant → diffuse /
+   metallic / glass shading → NEE direct; contributions accumulate
+   into `bloom_scratch_buf`.
+4. **Bloom postshader** — for each active slot, a 256-thread workgroup
+   loads the slot's rays from `bloom_scratch_buf` and reduces them to a
+   mean via parallel reduction; the result is written to `scratch_buf`
+   at the slot's pixel index, replacing (not adding to) the mainline
+   single-ray contribution for that pixel.
+5. **Accumulate** — accumulates `scratch_buf` (sum of all bounce
    contributions) into a persistent weighted-sum buffer via
    `accum += scratch`; the resolve pass divides by frame count to
    produce the display image
-4. **Blit** — fullscreen blit reads the current `rgba16float` accum
+6. **Variance + selection** — after accumulation, a variance pass
+   computes per-pixel variance from the running sum and sum-of-squares;
+   the selection pass uses hysteresis thresholds to promote
+   high-variance pixels into bloom slots for the next frame and evict
+   converged pixels, re-reserving fresh slot indices each frame to
+   prevent cross-pixel collisions.
+7. **Blit** — fullscreen blit reads the current `rgba16float` accum
    texture to canvas (Khronos PBR Neutral tonemapping in a later step)
 
-Current scene: six analytic spheres — glass sphere (`IOR=1.5`, mat 1)
-with a small air-bubble inclusion (mat 4) near its centre; warm tan
-diffuse sphere (mat 2) and metallic mirror sphere (mat 3) flanking it;
-a large enclosing glass sphere (mat 1) with its own air-bubble interior
-(mat 4). Point light at (2, 4, 2), warm white, intensity 20. Background:
-procedural spherical checkerboard (royal blue / yellow). Medium stack
-depth 8. Material indices: 0=air, 1=glass (`IOR=1.5`), 2=diffuse,
-3=metallic, 4=glass air-bubble (`IOR=1.0`). Magenta = medium stack
-underflow (geometry error).
+Current scene: six analytic spheres forming an egg stand-in — two
+nested XZ-scaled glass spheres (mat 1, `IOR=1.5`) for the outer shell
+and inner cavity (mat 4, `IOR=1.0` air bubble); a small glass sphere
+(mat 1) with its own air-bubble inclusion (mat 4) inside the egg; a
+diffuse sphere (mat 2) and a metallic mirror sphere (mat 3) inside the
+egg — the checkerboard visible in the mirror is the background
+environment map reflected. Point light at (2, 4, 2), warm white,
+intensity 20. Background: procedural spherical checkerboard (royal blue
+/ yellow). Medium stack depth 8. Material indices: 0=air, 1=glass
+(`IOR=1.5`), 2=diffuse, 3=metallic, 4=air-bubble (`IOR=1.0`). Magenta
+= medium stack underflow (geometry error).
+
+Performance at 600×800 on Apple M2 (Chromium 148): ~15–25 FPS,
+~7–12 Mrays/s depending on bloom occupancy. Bloom occupancy is
+reported live in the HUD (`bloom NNN / CAPACITY`).
 
 ## Known Issues
 
@@ -103,6 +129,11 @@ not affect rendering correctness when working.
       `pixel_seed` canonical PCG spatial-hash RNG established in
       `shade_common.wgsl`, mixing pixel coordinates, frame, and bounce
       to break scanline correlation
+- [x] Step 9.5 — Bloom convergence acceleration:
+      per-pixel variance tracking, hysteresis-gated
+      slot promotion, 256-ray bloom pass with
+      background shader variant, postshader parallel
+      reduction, bloom occupancy HUD (B12–B15)
 - [ ] Step 10 — Denoiser
 - [ ] Step 11 — Tone mapping and bloom
 - [ ] Step 12 — Ball animation

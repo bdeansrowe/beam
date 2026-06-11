@@ -28,10 +28,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let bloom_slot = u32(pixel_buf[idx].bloom_slot);
 
-    for (var sample_i: u32 = 0u; sample_i < 256u; sample_i = sample_i + 1u) {
-        // Sub-pixel jitter via Halton. frame * 256 + sample_i extends ray_gen's
-        // halton2(frame) seed so each of the 256 rays samples a distinct sub-pixel location.
-        let halton_idx = frame_data.frame * 256u + sample_i + 1u;
+    for (var sample_i: u32 = 0u; sample_i < BLOOM_AMPLIFICATION; sample_i = sample_i + 1u) {
+        // Sub-pixel jitter via Halton. frame * BLOOM_AMPLIFICATION + sample_i extends ray_gen's
+        // halton2(frame) seed so each bloom ray samples a distinct sub-pixel location.
+        let halton_idx = frame_data.frame * BLOOM_AMPLIFICATION + sample_i + 1u;
         let jitter = vec2<f32>(halton(halton_idx, 2u), halton(halton_idx, 3u))
                    * BLOOM_FILTER_WIDTH;
 
@@ -55,6 +55,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         r.seed         = ray_seed;
         // medium_stack zero-initialised by var declaration; medium_depth=0 means none active.
 
-        bloom_slot_buf[bloom_slot * 256u + sample_i] = r;
+        bloom_slot_buf[bloom_slot * BLOOM_AMPLIFICATION + sample_i] = r;
     }
 }
