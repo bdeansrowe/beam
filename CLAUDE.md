@@ -59,27 +59,45 @@ cd web && basic-http-server --addr 127.0.0.1:9666 .
 cd web && python3 -m http.server 9666
 
 # Syntax/type check — ALWAYS use the WASM target:
+# Only use if Rust files have changed; WGSL files are invisible to `cargo check`. See `cargo wgsl` below.
 cargo check --target wasm32-unknown-unknown
 # The native target produces irrelevant Send/Sync errors from
 # Rc<Window> and is not a valid check for this project.
+
+# Validate WGSL shaders without a full build
+# The VS Code WGSL extension uses this for live error reporting.
+cargo wgsl
 ```
 
 **Browser:** Vivaldi or Chrome 113+ required for WebGPU. Open DevTools console for GPU errors.
 
 **Prerequisites:** `cargo install wasm-pack basic-http-server` and `rustup target add wasm32-unknown-unknown`.
 
+### Bloom Constant Sync — Manual, No Codegen Yet
+
+`BLOOM_SLOT_CAPACITY` and `BLOOM_AMPLIFICATION` are declared in two places and must be kept in sync manually:
+- `gpu.rs`: `BLOOM_AMPLIFICATION` (const) and `bloom_slot_capacity` (runtime value)
+- `common_common.wgsl`: `BLOOM_AMPLIFICATION` and `BLOOM_SLOT_CAPACITY` (const)
+
+The `bloom_postshader` workgroup size (256) and `wg_accum` array size (256) are hardwired to
+`BLOOM_AMPLIFICATION`. If `BLOOM_AMPLIFICATION` changes, the postshader reduction must be
+restructured -- it is not a simple constant swap.
+
+`build.rs` codegen to enforce sync is on the deferred list.
+
 ---
 ## Agentic Session Protocol
 
-At the start of every implementation session, before
-writing any code, present a numbered plan of all
-intended steps and wait for approval before proceeding.
-This allows the co-author supervisors to review the full
-scope before any diffs land.
+At the start of every implementation session, you MUST
+present a numbered plan of all intended steps and wait
+for explicit approval before proceeding. This is
+non-negotiable. Do not read files, search for patterns,
+or take any implementation action before the plan is
+approved. If you find yourself about to write code
+without an approved plan, stop and present the plan
+first.
 
-Execute steps sequentially, one at a time. Run
-`cargo check --target wasm32-unknown-unknown` after
-each step before proceeding to the next. Do not
+Execute steps sequentially, one at a time. Do not
 parallelize steps or combine steps into a single edit.
 
 ---
@@ -102,7 +120,7 @@ The following Markdown files in the repo root are design/context documents from 
 - **Render architecture:** Wavefront compute pipeline → HDR storage
   texture → blit to canvas
 - **Dev server:** Simple HTTP server on port 9666
-- **Dev environment:** Vivaldi (Chromium 144) on ARM64 Mac (M2 MacBook Air, 10-core GPU)
+- **Dev environment:** Vivaldi (Chromium 148) on ARM64 Mac (M2 MacBook Air, 10-core GPU)
 - **Project structure:** `src/` (lib.rs, app.rs, gpu.rs, shader.wgsl) and
   `web/` (index.html, pkg/) — this directory is the project root
 
@@ -419,6 +437,16 @@ correct nested dielectric rendering of the glass egg and colored glass obstacles
 ### Russian Roulette Termination
 Implement probabilistic path termination to recover performance from low-contribution
 paths. Terminate paths before maximum bounce count when throughput is very low.
+
+### Bloom Roulette — Permanently Prohibited
+
+Bloom rays MUST NOT use Russian roulette. Roulette re-weights survivor throughput by 1/survival. When
+bloom rays survive multiple roulette rounds and then escape toward a minority background color, they write
+firefly-bright contributions that the postshader averages into the slot mean, producing persistent
+hue-shifted acne on glass-boundary pixels.
+
+Bloom is a variance-reduction pass. Roulette reintroduces the exact variance bloom was designed
+to suppress. The bloom bounce loop has no roulette dispatch. Do not add one.
 
 ### Stream Compaction
 Between wavefront stages, compact active rays into contiguous buffer before dispatch.
